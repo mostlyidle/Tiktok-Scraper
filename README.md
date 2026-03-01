@@ -203,20 +203,3 @@ tests/
     test_scraper.py    Scraper tests (yt-dlp + browser)
     test_downloader.py Downloader tests
 ```
-src/agenticworkflows/
-    __init__.py        Package init
-    __main__.py        python -m support
-    cli.py             Click CLI entry point
-    config.py          ScraperConfig dataclass
-    scraper.py         Video URL discovery (yt-dlp + Playwright fallback)
-    downloader.py      yt-dlp download with concurrency
-    models.py          VideoInfo, ScrapeResult dataclasses
-    exceptions.py      Custom exception hierarchy
-    utils.py           Helpers (video ID extraction, stealth browser, cookies)
-tests/
-    conftest.py        Shared fixtures
-    test_cli.py        CLI tests
-    test_scraper.py    Scraper tests (yt-dlp + browser)
-    test_downloader.py Downloader tests
-```
-
