@@ -1,0 +1,284 @@
+"""Unit tests for the scraper module."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from tiktok_scraper.config import ScraperConfig
+from tiktok_scraper.exceptions import CreatorNotFoundError
+from tiktok_scraper.models import VideoInfo
+from tiktok_scraper.scraper import (
+    _fetch_via_browser,
+    _fetch_via_ytdlp,
+    fetch_video_urls,
+)
+
+
+class TestFetchViaYtdlp:
+    """Tests for the yt-dlp discovery strategy."""
+
+    @pytest.mark.asyncio
+    async def test_discovers_videos(self, scraper_config: ScraperConfig) -> None:
+        """Should extract VideoInfo objects from yt-dlp playlist entries."""
+        fake_info = {
+            "_type": "playlist",
+            "entries": [
+                {
+                    "id": "7123456789012345678",
+                    "url": "https://www.tiktok.com/@testuser/video/7123456789012345678",
+                },
+                {
+                    "id": "7123456789012345679",
+                    "url": "https://www.tiktok.com/@testuser/video/7123456789012345679",
+                },
+            ],
+        }
+        with patch(
+            "tiktok_scraper.scraper._sync_extract",
+            return_value=fake_info,
+        ):
+            result = await _fetch_via_ytdlp(scraper_config)
+
+        assert len(result) == 2
+        ids = {v.video_id for v in result}
+        assert "7123456789012345678" in ids
+        assert "7123456789012345679" in ids
+
+    @pytest.mark.asyncio
+    async def test_respects_limit(self, tmp_path: Path) -> None:
+        """Should honour the limit setting."""
+        config = ScraperConfig(
+            username="testuser",
+            output_dir=tmp_path / "downloads",
+            limit=1,
+            scroll_delay_min=0.0,
+            scroll_delay_max=0.0,
+        )
+        fake_info = {
+            "_type": "playlist",
+            "entries": [
+                {
+                    "id": "7123456789012345678",
+                    "url": "https://www.tiktok.com/@testuser/video/7123456789012345678",
+                },
+                {
+                    "id": "7123456789012345679",
+                    "url": "https://www.tiktok.com/@testuser/video/7123456789012345679",
+                },
+            ],
+        }
+        with patch(
+            "tiktok_scraper.scraper._sync_extract",
+            return_value=fake_info,
+        ):
+            result = await _fetch_via_ytdlp(config)
+
+        assert len(result) <= 1
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_videos(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """Duplicate entries should be deduplicated."""
+        fake_info = {
+            "_type": "playlist",
+            "entries": [
+                {
+                    "id": "7123456789012345678",
+                    "url": "https://www.tiktok.com/@testuser/video/7123456789012345678",
+                },
+                {
+                    "id": "7123456789012345678",
+                    "url": "https://www.tiktok.com/@testuser/video/7123456789012345678",
+                },
+            ],
+        }
+        with patch(
+            "tiktok_scraper.scraper._sync_extract",
+            return_value=fake_info,
+        ):
+            result = await _fetch_via_ytdlp(scraper_config)
+
+        assert len(result) == 1
+        assert result[0].video_id == "7123456789012345678"
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_entries(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """Should return empty list when no entries are found."""
+        with patch(
+            "tiktok_scraper.scraper._sync_extract",
+            return_value=None,
+        ):
+            result = await _fetch_via_ytdlp(scraper_config)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_creator_not_found(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """Should raise CreatorNotFoundError for non-existent users."""
+        import yt_dlp
+
+        with (
+            patch(
+                "tiktok_scraper.scraper._sync_extract",
+                side_effect=yt_dlp.utils.DownloadError("This user does not exist"),
+            ),
+            pytest.raises(CreatorNotFoundError),
+        ):
+            await _fetch_via_ytdlp(scraper_config)
+
+
+class TestFetchViaBrowser:
+    """Tests for the Playwright browser fallback strategy."""
+
+    @pytest.mark.asyncio
+    async def test_creator_not_found_via_status_code(
+        self,
+        scraper_config: ScraperConfig,
+        mock_browser_context: AsyncMock,
+    ) -> None:
+        """A 404 response should raise CreatorNotFoundError."""
+        page = mock_browser_context.new_page.return_value
+        response = AsyncMock()
+        response.status = 404
+        page.goto.return_value = response
+
+        with pytest.raises(CreatorNotFoundError):
+            await _fetch_via_browser(scraper_config, mock_browser_context)
+
+    @pytest.mark.asyncio
+    async def test_creator_not_found_via_dom(
+        self,
+        scraper_config: ScraperConfig,
+        mock_browser_context: AsyncMock,
+    ) -> None:
+        """DOM indicator for missing account should raise CreatorNotFoundError."""
+        page = mock_browser_context.new_page.return_value
+
+        async def _query_selector(selector: str) -> MagicMock | None:
+            if "not-found" in selector or "Couldn't find" in selector:
+                return MagicMock()
+            return None
+
+        page.query_selector.side_effect = _query_selector
+
+        with pytest.raises(CreatorNotFoundError):
+            await _fetch_via_browser(scraper_config, mock_browser_context)
+
+    @pytest.mark.asyncio
+    async def test_collects_videos_from_dom(
+        self,
+        scraper_config: ScraperConfig,
+        mock_browser_context: AsyncMock,
+    ) -> None:
+        """Should collect video URLs from DOM links."""
+        page = mock_browser_context.new_page.return_value
+
+        video_call_count = 0
+
+        async def _query_selector_all(selector: str) -> list[AsyncMock]:
+            nonlocal video_call_count
+            if "/video/" not in selector:
+                return []
+            if video_call_count == 0:
+                video_call_count += 1
+                link1 = AsyncMock()
+                link1.get_attribute.return_value = (
+                    "https://www.tiktok.com/@testuser/video/7123456789012345678"
+                )
+                link2 = AsyncMock()
+                link2.get_attribute.return_value = (
+                    "https://www.tiktok.com/@testuser/video/7123456789012345679"
+                )
+                return [link1, link2]
+            return []
+
+        page.query_selector_all.side_effect = _query_selector_all
+
+        result = await _fetch_via_browser(scraper_config, mock_browser_context)
+
+        assert len(result) == 2
+        ids = {v.video_id for v in result}
+        assert "7123456789012345678" in ids
+        assert "7123456789012345679" in ids
+
+    @pytest.mark.asyncio
+    async def test_stops_after_stale_scrolls(
+        self,
+        scraper_config: ScraperConfig,
+        mock_browser_context: AsyncMock,
+    ) -> None:
+        """Should stop scrolling after MAX_STALE_SCROLLS with no new content."""
+        page = mock_browser_context.new_page.return_value
+        page.query_selector_all.return_value = []
+
+        result = await _fetch_via_browser(scraper_config, mock_browser_context)
+
+        assert len(result) == 0
+        assert page.evaluate.call_count > 0
+
+
+class TestFetchVideoUrls:
+    """Tests for the top-level fetch_video_urls orchestrator."""
+
+    @pytest.mark.asyncio
+    async def test_uses_ytdlp_primary(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """Should use yt-dlp as the primary discovery method."""
+        expected = [
+            VideoInfo(
+                video_id="7123456789012345678",
+                url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+            ),
+        ]
+        with patch(
+            "tiktok_scraper.scraper._fetch_via_ytdlp",
+            return_value=expected,
+        ) as mock_ytdlp:
+            result = await fetch_video_urls(scraper_config, browser_context=None)
+
+        mock_ytdlp.assert_awaited_once_with(scraper_config)
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_browser(
+        self,
+        scraper_config: ScraperConfig,
+        mock_browser_context: AsyncMock,
+    ) -> None:
+        """Should fall back to browser when yt-dlp fails."""
+        expected = [
+            VideoInfo(
+                video_id="7123456789012345678",
+                url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+            ),
+        ]
+        with (
+            patch(
+                "tiktok_scraper.scraper._fetch_via_ytdlp",
+                side_effect=RuntimeError("yt-dlp failed"),
+            ),
+            patch(
+                "tiktok_scraper.scraper._fetch_via_browser",
+                return_value=expected,
+            ) as mock_browser,
+        ):
+            result = await fetch_video_urls(
+                scraper_config,
+                browser_context=mock_browser_context,
+            )
+
+        mock_browser.assert_awaited_once_with(scraper_config, mock_browser_context)
+        assert result == expected
