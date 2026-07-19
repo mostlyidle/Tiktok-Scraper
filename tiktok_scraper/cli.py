@@ -14,7 +14,7 @@ from tiktok_scraper.downloader import download_videos
 from tiktok_scraper.exceptions import CreatorNotFoundError, ScraperError
 from tiktok_scraper.models import ScrapeResult
 from tiktok_scraper.scraper import fetch_video_urls
-from tiktok_scraper.utils import check_ffmpeg, create_stealth_browser_context
+from tiktok_scraper.utils import check_ffmpeg
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -151,30 +151,13 @@ def main(
 async def _run(config: ScraperConfig) -> ScrapeResult:
     """Async entry point: discover videos then download them.
 
-    Uses yt-dlp as the primary discovery mechanism.  If that fails,
-    falls back to a Playwright browser session.
+    Discovery uses yt-dlp first and starts a Playwright browser only when
+    yt-dlp cannot discover posts.
     """
-    _logger = logging.getLogger(__name__)
-
-    # Try yt-dlp first (no browser needed).
-    videos = await fetch_video_urls(config, browser_context=None)
-
-    # If yt-dlp returned nothing, try the browser fallback.
-    if not videos:
-        _logger.info("Attempting Playwright browser fallback...")
-        pw, browser, context = await create_stealth_browser_context(
-            headless=config.headless,
-            cookies_file=config.cookies_file,
-        )
-        try:
-            videos = await fetch_video_urls(config, browser_context=context)
-        finally:
-            await context.close()
-            await browser.close()
-            await pw.stop()
+    videos = await fetch_video_urls(config)
 
     if not videos:
-        _logger.warning("No videos found for @%s.", config.username)
+        logging.getLogger(__name__).warning("No videos found for @%s.", config.username)
         return ScrapeResult(username=config.username)
 
     result = await download_videos(videos, config)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import urllib.error
 from pathlib import Path
@@ -15,6 +16,7 @@ from tiktok_scraper.downloader import (
     _extract_image_urls,
     _has_video_formats,
     _sync_download_file,
+    _sync_download_info,
     download_videos,
 )
 from tiktok_scraper.models import ScrapeResult, VideoInfo
@@ -166,7 +168,7 @@ class TestDownloadVideos:
                 "tiktok_scraper.downloader._sync_extract_info",
                 return_value=_VIDEO_INFO,
             ),
-            patch("tiktok_scraper.downloader._sync_download") as mock_dl,
+            patch("tiktok_scraper.downloader._sync_download_info") as mock_dl,
         ):
             result = await download_videos(sample_videos, scraper_config)
 
@@ -207,7 +209,7 @@ class TestDownloadVideos:
 
         with (
             patch("tiktok_scraper.downloader._sync_extract_info"),
-            patch("tiktok_scraper.downloader._sync_download") as mock_dl,
+            patch("tiktok_scraper.downloader._sync_download_info") as mock_dl,
         ):
             result = await download_videos(sample_videos, scraper_config)
 
@@ -235,7 +237,7 @@ class TestDownloadVideos:
                 "tiktok_scraper.downloader._sync_extract_info",
                 return_value=_VIDEO_INFO,
             ),
-            patch("tiktok_scraper.downloader._sync_download"),
+            patch("tiktok_scraper.downloader._sync_download_info"),
         ):
             await download_videos(videos, scraper_config)
 
@@ -260,7 +262,7 @@ class TestDownloadVideos:
                 return_value=_VIDEO_INFO,
             ),
             patch(
-                "tiktok_scraper.downloader._sync_download",
+                "tiktok_scraper.downloader._sync_download_info",
                 side_effect=RuntimeError("network error"),
             ),
         ):
@@ -314,7 +316,7 @@ class TestDownloadVideos:
                 "tiktok_scraper.downloader._sync_extract_info",
                 return_value=_VIDEO_INFO,
             ),
-            patch("tiktok_scraper.downloader._sync_download"),
+            patch("tiktok_scraper.downloader._sync_download_info"),
         ):
             result = await download_videos(videos, scraper_config)
 
@@ -428,6 +430,60 @@ class TestPhotoSlideshow:
         images = list(photo_dir.iterdir())
         assert len(images) == 2
 
+    @pytest.mark.asyncio
+    async def test_failed_slideshow_is_not_marked_as_downloaded(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """A failed slideshow should retry instead of being skipped on rerun."""
+        video = VideoInfo(
+            video_id="7123456789012345678",
+            url="https://www.tiktok.com/@testuser/photo/7123456789012345678",
+        )
+
+        def fail_second_image(url: str, dest: Path, **_kwargs: object) -> None:
+            if url.endswith("img2.jpg"):
+                raise OSError("network error")
+            dest.write_bytes(b"fake image data")
+
+        with (
+            patch(
+                "tiktok_scraper.downloader._sync_extract_info",
+                return_value=_SLIDESHOW_INFO,
+            ),
+            patch(
+                "tiktok_scraper.downloader._sync_download_file",
+                side_effect=fail_second_image,
+            ),
+        ):
+            failed_result = await download_videos([video], scraper_config)
+
+        photo_dir = scraper_config.output_dir / video.video_id
+        staging_dir = scraper_config.output_dir / f".{video.video_id}.partial"
+        assert failed_result.failed == 1
+        assert not photo_dir.exists()
+        assert staging_dir.is_dir()
+
+        def save_image(_url: str, dest: Path, **_kwargs: object) -> None:
+            dest.write_bytes(b"fake image data")
+
+        with (
+            patch(
+                "tiktok_scraper.downloader._sync_extract_info",
+                return_value=_SLIDESHOW_INFO,
+            ),
+            patch(
+                "tiktok_scraper.downloader._sync_download_file",
+                side_effect=save_image,
+            ) as mock_download,
+        ):
+            retry_result = await download_videos([video], scraper_config)
+
+        assert retry_result.photos_downloaded == 1
+        assert mock_download.call_count == 2
+        assert photo_dir.is_dir()
+        assert not staging_dir.exists()
+
 
 class TestVideoOnly:
     """Tests for the --video-only flag."""
@@ -450,7 +506,7 @@ class TestVideoOnly:
                 "tiktok_scraper.downloader._sync_extract_info",
                 return_value=_AUDIO_ONLY_INFO,
             ),
-            patch("tiktok_scraper.downloader._sync_download") as mock_dl,
+            patch("tiktok_scraper.downloader._sync_download_info") as mock_dl,
         ):
             result = await download_videos(videos, video_only_config)
 
@@ -477,7 +533,7 @@ class TestVideoOnly:
                 "tiktok_scraper.downloader._sync_extract_info",
                 return_value=_AUDIO_ONLY_INFO,
             ),
-            patch("tiktok_scraper.downloader._sync_download") as mock_dl,
+            patch("tiktok_scraper.downloader._sync_download_info") as mock_dl,
         ):
             result = await download_videos(videos, scraper_config)
 
@@ -527,7 +583,7 @@ class TestVideoOnly:
                 "tiktok_scraper.downloader._sync_extract_info",
                 return_value=_VIDEO_INFO,
             ),
-            patch("tiktok_scraper.downloader._sync_download"),
+            patch("tiktok_scraper.downloader._sync_download_info"),
         ):
             result = await download_videos(videos, video_only_config)
 
@@ -544,10 +600,11 @@ class TestSyncDownloadFileRetry:
 
         with patch("tiktok_scraper.downloader.urllib.request.urlopen") as mock_open:
             mock_resp = mock_open.return_value.__enter__.return_value
-            mock_resp.read.return_value = b"fake image"
+            mock_resp.read.side_effect = [b"fake image", b""]
             _sync_download_file("https://cdn.example.com/img.jpg", dest, retries=3)
 
         assert dest.read_bytes() == b"fake image"
+        assert not dest.with_name("image.jpg.part").exists()
 
     def test_retries_on_http_503(self, tmp_path: Path) -> None:
         """Should retry on HTTP 503 and succeed on a subsequent attempt."""
@@ -563,7 +620,7 @@ class TestSyncDownloadFileRetry:
         ):
             ctx_mgr = mock_open.return_value.__enter__
             # First call raises 503, second succeeds.
-            success_resp = type("Resp", (), {"read": lambda self: b"ok"})()
+            success_resp = io.BytesIO(b"ok")
             ctx_mgr.side_effect = [error_503, success_resp]
             _sync_download_file("https://cdn.example.com/img.jpg", dest, retries=3)
 
@@ -582,7 +639,7 @@ class TestSyncDownloadFileRetry:
             patch("tiktok_scraper.downloader.time.sleep"),
         ):
             ctx_mgr = mock_open.return_value.__enter__
-            success_resp = type("Resp", (), {"read": lambda self: b"ok"})()
+            success_resp = io.BytesIO(b"ok")
             ctx_mgr.side_effect = [error_429, success_resp]
             _sync_download_file("https://cdn.example.com/img.jpg", dest, retries=3)
 
@@ -632,7 +689,7 @@ class TestSyncDownloadFileRetry:
             patch("tiktok_scraper.downloader.time.sleep"),
         ):
             ctx_mgr = mock_open.return_value.__enter__
-            success_resp = type("Resp", (), {"read": lambda self: b"ok"})()
+            success_resp = io.BytesIO(b"ok")
             ctx_mgr.side_effect = [
                 urllib.error.URLError("Connection reset"),
                 success_resp,
@@ -640,6 +697,19 @@ class TestSyncDownloadFileRetry:
             _sync_download_file("https://cdn.example.com/img.jpg", dest, retries=3)
 
         assert dest.read_bytes() == b"ok"
+
+
+class TestPreExtractedDownload:
+    """Tests for downloading yt-dlp metadata without another URL extraction."""
+
+    def test_processes_preextracted_info(self) -> None:
+        opts = {"quiet": True}
+        with patch("tiktok_scraper.downloader.yt_dlp.YoutubeDL") as mock_ydl:
+            ydl = mock_ydl.return_value.__enter__.return_value
+            _sync_download_info(_VIDEO_INFO, opts)  # type: ignore[arg-type]
+
+        ydl.process_ie_result.assert_called_once_with(_VIDEO_INFO, download=True)
+        ydl.extract_info.assert_not_called()
 
 
 class TestBuildYdlOpts:

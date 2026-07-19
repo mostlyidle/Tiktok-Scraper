@@ -20,6 +20,9 @@ from tiktok_scraper.utils import get_downloaded_ids
 
 logger = logging.getLogger(__name__)
 
+_MAX_CONCURRENT_IMAGE_DOWNLOADS = 3
+_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
 
 class _DownloadOutcome(enum.Enum):
     """Result of a single download attempt."""
@@ -39,8 +42,8 @@ async def download_videos(
 
     Already-downloaded content (detected by file-name or directory matching
     on video ID) is automatically skipped.  Downloads are limited to
-    ``config.max_concurrent_downloads`` at a time via an
-    :class:`asyncio.Semaphore`.
+    ``config.max_concurrent_downloads`` at a time via a fixed-size worker
+    pool.
 
     When a post is a photo slideshow (no video stream), the individual
     images are downloaded directly.  If ``config.video_only`` is ``True``,
@@ -81,22 +84,48 @@ async def download_videos(
         config.max_concurrent_downloads,
     )
 
-    semaphore = asyncio.Semaphore(config.max_concurrent_downloads)
+    image_semaphore = asyncio.Semaphore(
+        min(config.max_concurrent_downloads, _MAX_CONCURRENT_IMAGE_DOWNLOADS)
+    )
+    queue: asyncio.Queue[tuple[int, VideoInfo] | None] = asyncio.Queue()
+    outcomes: list[_DownloadOutcome | Exception | None] = [None] * len(to_download)
 
-    async def _guarded_download(
-        video: VideoInfo,
-        index: int,
-    ) -> _DownloadOutcome:
-        async with semaphore:
-            return await _download_single(video, config, index, len(to_download))
+    for index, video in enumerate(to_download):
+        queue.put_nowait((index, video))
 
-    tasks = [
-        _guarded_download(video, idx) for idx, video in enumerate(to_download, start=1)
-    ]
-    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    async def _worker() -> None:
+        while True:
+            item = await queue.get()
+            try:
+                if item is None:
+                    return
+
+                outcome_index, video = item
+                try:
+                    outcomes[outcome_index] = await _download_single(
+                        video,
+                        config,
+                        outcome_index + 1,
+                        len(to_download),
+                        image_semaphore,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    outcomes[outcome_index] = exc
+            finally:
+                queue.task_done()
+
+    worker_count = min(config.max_concurrent_downloads, len(to_download))
+    workers = [asyncio.create_task(_worker()) for _ in range(worker_count)]
+    await queue.join()
+
+    for _ in workers:
+        queue.put_nowait(None)
+    await asyncio.gather(*workers)
 
     for video, outcome in zip(to_download, outcomes, strict=True):
-        if isinstance(outcome, BaseException):
+        if isinstance(outcome, Exception):
             result.failed += 1
             result.failed_videos.append(video.video_id)
             logger.error("Download failed for %s: %s", video.video_id, outcome)
@@ -125,6 +154,7 @@ async def _download_single(
     config: ScraperConfig,
     index: int,
     total: int,
+    image_semaphore: asyncio.Semaphore,
 ) -> _DownloadOutcome:
     """Download a single post.
 
@@ -175,7 +205,7 @@ async def _download_single(
         try:
             await loop.run_in_executor(
                 None,
-                functools.partial(_sync_download, video.url, ydl_opts),
+                functools.partial(_sync_download_info, info, ydl_opts),
             )
             logger.info("[%d/%d] Completed video %s.", index, total, video.video_id)
             return _DownloadOutcome.VIDEO
@@ -205,7 +235,7 @@ async def _download_single(
                 image_urls,
                 config.output_dir,
                 video.video_id,
-                loop,
+                image_semaphore,
                 retries=config.download_retries,
             )
             logger.info(
@@ -247,7 +277,7 @@ async def _download_single(
     try:
         await loop.run_in_executor(
             None,
-            functools.partial(_sync_download, video.url, ydl_opts),
+            functools.partial(_sync_download_info, info, ydl_opts),
         )
         logger.info("[%d/%d] Completed audio %s.", index, total, video.video_id)
         return _DownloadOutcome.VIDEO
@@ -381,33 +411,54 @@ async def _download_images(
     image_urls: list[str],
     output_dir: Path,
     video_id: str,
-    loop: asyncio.AbstractEventLoop,
+    image_semaphore: asyncio.Semaphore,
     *,
     retries: int = 3,
 ) -> None:
     """Download slideshow images into ``output_dir/<video_id>/``.
 
+    Images are first written to a non-numeric staging directory.  The
+    directory is renamed only after every image succeeds so resume detection
+    never mistakes a partial slideshow for a completed one.
+
     Args:
         image_urls: URLs of the images to download.
         output_dir: Base output directory.
         video_id: The TikTok post ID (used as subdirectory name).
-        loop: The running event loop for executor calls.
+        image_semaphore: Session-wide limit for concurrent image downloads.
         retries: Number of retry attempts per image on transient failures.
 
     Raises:
         Exception: If any image download fails after all retries.
     """
     photo_dir = output_dir / video_id
-    photo_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = output_dir / f".{video_id}.partial"
+    staging_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, url in enumerate(image_urls, start=1):
+    async def _download_one(idx: int, url: str) -> None:
         ext = _image_extension(url)
-        dest = photo_dir / f"image_{idx}{ext}"
-        await loop.run_in_executor(
-            None,
-            functools.partial(_sync_download_file, url, dest, retries=retries),
-        )
+        dest = staging_dir / f"image_{idx}{ext}"
+        async with image_semaphore:
+            await asyncio.to_thread(
+                _sync_download_file,
+                url,
+                dest,
+                retries=retries,
+            )
         logger.debug("Saved %s", dest)
+
+    outcomes = await asyncio.gather(
+        *(
+            _download_one(idx, url)
+            for idx, url in enumerate(image_urls, start=1)
+        ),
+        return_exceptions=True,
+    )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+
+    staging_dir.replace(photo_dir)
 
 
 def _sync_download_file(
@@ -445,7 +496,11 @@ def _sync_download_file(
     for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                dest.write_bytes(resp.read())
+                temp_dest = dest.with_name(f"{dest.name}.part")
+                with temp_dest.open("wb") as output:
+                    while chunk := resp.read(_DOWNLOAD_CHUNK_SIZE):
+                        output.write(chunk)
+                temp_dest.replace(dest)
             return
         except urllib.error.HTTPError as exc:
             last_exc = exc
@@ -496,10 +551,13 @@ def _image_extension(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _sync_download(url: str, opts: dict[str, str | int | bool]) -> None:
-    """Synchronous yt-dlp download (runs inside an executor)."""
+def _sync_download_info(
+    info: dict[str, Any],
+    opts: dict[str, str | int | bool],
+) -> None:
+    """Download pre-extracted yt-dlp metadata without resolving its URL again."""
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+        ydl.process_ie_result(info, download=True)
 
 
 def _build_ydl_opts(config: ScraperConfig) -> dict[str, str | int | bool]:

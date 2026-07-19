@@ -15,12 +15,16 @@ import logging
 from typing import Any
 
 import yt_dlp
-from playwright.async_api import BrowserContext, Page, Response
+from playwright.async_api import BrowserContext, Page, Response, TimeoutError
 
 from tiktok_scraper.config import ScraperConfig
 from tiktok_scraper.exceptions import BrowserError, CreatorNotFoundError
 from tiktok_scraper.models import VideoInfo
-from tiktok_scraper.utils import extract_post_id, random_delay
+from tiktok_scraper.utils import (
+    create_stealth_browser_context,
+    extract_post_id,
+    random_delay,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +49,13 @@ async def fetch_video_urls(
     """Discover video URLs for a TikTok creator.
 
     Tries yt-dlp first (fast, reliable, handles anti-bot natively).
-    Falls back to Playwright browser scraping when *browser_context* is
-    provided and yt-dlp fails.
+    Falls back to Playwright browser scraping when yt-dlp fails.  A supplied
+    *browser_context* is reused; otherwise one is created only for the
+    fallback attempt.
 
     Args:
         config: The scraper configuration (username, limit, etc.).
-        browser_context: Optional Playwright browser context for the
+        browser_context: Optional Playwright browser context to use for the
             browser-based fallback strategy.
 
     Returns:
@@ -79,13 +84,24 @@ async def fetch_video_urls(
         )
 
     # ---- Strategy 2: Playwright browser (fallback) ----
-    if browser_context is None:
-        raise BrowserError(
-            f"yt-dlp could not discover videos for @{config.username} and "
-            "no browser context was provided for fallback."
-        )
+    if browser_context is not None:
+        return await _fetch_via_browser(config, browser_context)
 
-    return await _fetch_via_browser(config, browser_context)
+    logger.info("Attempting Playwright browser fallback...")
+    try:
+        pw, browser, context = await create_stealth_browser_context(
+            headless=config.headless,
+            cookies_file=config.cookies_file,
+        )
+    except Exception as exc:
+        raise BrowserError(f"Could not start browser fallback: {exc}") from exc
+
+    try:
+        return await _fetch_via_browser(config, context)
+    finally:
+        await context.close()
+        await browser.close()
+        await pw.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -230,14 +246,10 @@ async def _fetch_via_browser(
         if response is not None and response.status == 404:
             raise CreatorNotFoundError(config.username)
 
-        # Wait for the page to settle — TikTok's SPA needs a moment.
-        await page.wait_for_timeout(5000)
+        await _wait_for_initial_content(page)
 
         # Dismiss cookie/consent banners and CAPTCHAs.
         await _dismiss_overlays(page)
-
-        # Wait a bit more after dismissing overlays.
-        await page.wait_for_timeout(2000)
 
         # Check for "user not found" indicators in the DOM.
         await _check_creator_exists(page, config.username)
@@ -309,6 +321,21 @@ async def _fetch_via_browser(
 # ---------------------------------------------------------------------------
 
 
+async def _wait_for_initial_content(page: Page) -> None:
+    """Wait briefly for profile content or hydration data to become available."""
+    try:
+        await page.wait_for_function(
+            """() => Boolean(
+                document.querySelector('a[href*="/video/"], a[href*="/photo/"]') ||
+                window.SIGI_STATE ||
+                window.__UNIVERSAL_DATA_FOR_REHYDRATION__
+            )""",
+            timeout=5000,
+        )
+    except TimeoutError:
+        logger.debug("Timed out waiting for initial profile content.")
+
+
 async def _dismiss_overlays(page: Page) -> None:
     """Dismiss cookie consent banners, CAPTCHAs, and other overlays.
 
@@ -317,11 +344,14 @@ async def _dismiss_overlays(page: Page) -> None:
     Playwright selectors and direct JS clicks.
     """
     # Try JS-based CAPTCHA close first (bypasses overlay interception).
-    await page.evaluate("""() => {
+    captcha_closed: bool = await page.evaluate("""() => {
         const btn = document.getElementById('captcha_close_button');
-        if (btn) btn.click();
+        if (!btn) return false;
+        btn.click();
+        return true;
     }""")
-    await page.wait_for_timeout(500)
+    if captcha_closed:
+        await page.wait_for_timeout(500)
 
     dismiss_selectors = [
         # Cookie consent banner buttons

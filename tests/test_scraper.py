@@ -211,6 +211,8 @@ class TestFetchViaBrowser:
         ids = {v.video_id for v in result}
         assert "7123456789012345678" in ids
         assert "7123456789012345679" in ids
+        page.wait_for_function.assert_awaited_once()
+        page.wait_for_timeout.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_stops_after_stale_scrolls(
@@ -282,3 +284,45 @@ class TestFetchVideoUrls:
 
         mock_browser.assert_awaited_once_with(scraper_config, mock_browser_context)
         assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_creates_browser_for_fallback_when_none_is_supplied(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """The public discovery path should start and clean up its own fallback."""
+        expected = [
+            VideoInfo(
+                video_id="7123456789012345678",
+                url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+            ),
+        ]
+        playwright = AsyncMock()
+        browser = AsyncMock()
+        context = AsyncMock()
+
+        with (
+            patch(
+                "tiktok_scraper.scraper._fetch_via_ytdlp",
+                side_effect=RuntimeError("yt-dlp failed"),
+            ),
+            patch(
+                "tiktok_scraper.scraper.create_stealth_browser_context",
+                return_value=(playwright, browser, context),
+            ) as mock_create_context,
+            patch(
+                "tiktok_scraper.scraper._fetch_via_browser",
+                return_value=expected,
+            ) as mock_browser_fetch,
+        ):
+            result = await fetch_video_urls(scraper_config)
+
+        assert result == expected
+        mock_create_context.assert_awaited_once_with(
+            headless=scraper_config.headless,
+            cookies_file=scraper_config.cookies_file,
+        )
+        mock_browser_fetch.assert_awaited_once_with(scraper_config, context)
+        context.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
+        playwright.stop.assert_awaited_once()
