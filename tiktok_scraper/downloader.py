@@ -16,7 +16,14 @@ import yt_dlp
 
 from tiktok_scraper.config import ScraperConfig
 from tiktok_scraper.models import ScrapeResult, VideoInfo
-from tiktok_scraper.utils import get_downloaded_ids
+from tiktok_scraper.utils import (
+    bounded_backoff,
+    check_ffmpeg,
+    cleanup_temporary_artifacts,
+    get_downloaded_ids,
+    is_completed_artifact,
+    parse_retry_after,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +64,7 @@ async def download_videos(
         A :class:`ScrapeResult` summarising the session.
     """
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_temporary_artifacts(config.output_dir)
 
     existing_ids = get_downloaded_ids(config.output_dir)
     result = ScrapeResult(
@@ -173,9 +181,13 @@ async def _download_single(
     extract_opts = _build_extract_opts(config)
 
     try:
-        info = await loop.run_in_executor(
-            None,
-            functools.partial(_sync_extract_info, video.url, extract_opts),
+        info = await _retry_operation(
+            lambda: loop.run_in_executor(
+                None,
+                functools.partial(_sync_extract_info, video.url, extract_opts),
+            ),
+            config,
+            "metadata extraction",
         )
     except Exception as exc:
         logger.error(
@@ -201,12 +213,27 @@ async def _download_single(
     if has_video:
         # Standard video post — download via yt-dlp.
         logger.info("[%d/%d] Downloading video %s ...", index, total, video.video_id)
-        ydl_opts = _build_ydl_opts(config)
-        try:
-            await loop.run_in_executor(
-                None,
-                functools.partial(_sync_download_info, info, ydl_opts),
+        ffmpeg_available = check_ffmpeg()
+        if _requires_ffmpeg(info) and not ffmpeg_available:
+            logger.error(
+                "[%d/%d] ffmpeg is required to merge video and audio for %s.",
+                index,
+                total,
+                video.video_id,
             )
+            return _DownloadOutcome.FAILED
+        ydl_opts = _build_ydl_opts(config, merge=ffmpeg_available)
+        try:
+            artifact_valid = await _retry_operation(
+                lambda: loop.run_in_executor(
+                    None,
+                    functools.partial(_sync_download_info, info, ydl_opts),
+                ),
+                config,
+                f"video {video.video_id}",
+            )
+            if artifact_valid is False or artifact_valid is None:
+                raise DownloadArtifactError(video.video_id)
             logger.info("[%d/%d] Completed video %s.", index, total, video.video_id)
             return _DownloadOutcome.VIDEO
         except Exception as exc:
@@ -273,12 +300,18 @@ async def _download_single(
         total,
         video.video_id,
     )
-    ydl_opts = _build_ydl_opts(config)
+    ydl_opts = _build_ydl_opts(config, merge=False)
     try:
-        await loop.run_in_executor(
-            None,
-            functools.partial(_sync_download_info, info, ydl_opts),
+        artifact_valid = await _retry_operation(
+            lambda: loop.run_in_executor(
+                None,
+                functools.partial(_sync_download_info, info, ydl_opts),
+            ),
+            config,
+            f"audio {video.video_id}",
         )
+        if artifact_valid is False or artifact_valid is None:
+            raise DownloadArtifactError(video.video_id)
         logger.info("[%d/%d] Completed audio %s.", index, total, video.video_id)
         return _DownloadOutcome.VIDEO
     except Exception as exc:
@@ -299,7 +332,7 @@ async def _download_single(
 
 def _sync_extract_info(
     url: str,
-    opts: dict[str, str | int | bool],
+    opts: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Extract post metadata without downloading (runs in an executor)."""
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -309,11 +342,89 @@ def _sync_extract_info(
         return dict(result)
 
 
-def _build_extract_opts(config: ScraperConfig) -> dict[str, str | int | bool]:
+class DownloadArtifactError(RuntimeError):
+    """Raised when yt-dlp returns without producing a completed artifact."""
+
+
+async def _retry_operation(operation: Any, config: ScraperConfig, label: str) -> Any:
+    """Retry transient yt-dlp work with bounded exponential backoff."""
+    attempts = max(1, config.download_retries)
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            if not _is_retryable_download_error(exc) or attempt >= attempts:
+                raise
+            delay = bounded_backoff(
+                attempt,
+                base=config.retry_backoff_base,
+                cap=config.retry_backoff_max,
+                retry_after=_retry_after_from_exception(exc),
+            )
+            logger.warning(
+                "%s failed (attempt %d/%d): %s; retrying in %.1fs",
+                label.capitalize(),
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise AssertionError("retry loop must return or raise")
+
+
+def _is_retryable_download_error(exc: Exception) -> bool:
+    """Classify yt-dlp errors conservatively for retry purposes."""
+    message = str(exc).lower()
+    permanent = (
+        "404",
+        "not found",
+        "does not exist",
+        "unsupported url",
+        "private video",
+        "login required",
+        "copyright",
+        "forbidden",
+        "permission denied",
+        "invalid format",
+    )
+    if any(phrase in message for phrase in permanent):
+        return False
+    if isinstance(exc, DownloadArtifactError):
+        return False
+    if isinstance(exc, (TimeoutError, OSError, ConnectionError)):
+        return True
+    transient = (
+        "429",
+        "rate limit",
+        "too many requests",
+        "temporarily",
+        "timeout",
+        "timed out",
+        "network",
+        "connection",
+        "502",
+        "503",
+        "504",
+    )
+    return any(phrase in message for phrase in transient)
+
+
+def _retry_after_from_exception(exc: Exception) -> float | None:
+    """Read a Retry-After hint when an HTTP error exposes one."""
+    headers = getattr(exc, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get("Retry-After") or headers.get("retry-after")
+    return parse_retry_after(str(value)) if value is not None else None
+
+
+def _build_extract_opts(config: ScraperConfig) -> dict[str, Any]:
     """Construct yt-dlp options for metadata-only extraction."""
-    opts: dict[str, str | int | bool] = {
+    opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "sleep_interval_requests": config.request_delay,
     }
     if config.cookies_file is not None:
         opts["cookiefile"] = str(config.cookies_file)
@@ -328,6 +439,23 @@ def _has_video_formats(info: dict[str, Any]) -> bool:
         vcodec = str(info.get("vcodec", "none"))
         return vcodec != "none"
     return any(str(fmt.get("vcodec", "none")) != "none" for fmt in formats)
+
+
+def _requires_ffmpeg(info: dict[str, Any]) -> bool:
+    """Return whether available formats require a video/audio merge."""
+    formats: list[dict[str, Any]] = info.get("formats", [])
+    if not formats:
+        return (
+            str(info.get("vcodec", "none")) != "none"
+            and str(info.get("acodec", "none")) == "none"
+        )
+    has_video = any(str(fmt.get("vcodec", "none")) != "none" for fmt in formats)
+    has_progressive = any(
+        str(fmt.get("vcodec", "none")) != "none"
+        and str(fmt.get("acodec", "none")) != "none"
+        for fmt in formats
+    )
+    return has_video and not has_progressive
 
 
 def _extract_image_urls(info: dict[str, Any]) -> list[str]:
@@ -448,10 +576,7 @@ async def _download_images(
         logger.debug("Saved %s", dest)
 
     outcomes = await asyncio.gather(
-        *(
-            _download_one(idx, url)
-            for idx, url in enumerate(image_urls, start=1)
-        ),
+        *(_download_one(idx, url) for idx, url in enumerate(image_urls, start=1)),
         return_exceptions=True,
     )
     for outcome in outcomes:
@@ -493,7 +618,8 @@ def _sync_download_file(
     )
 
     last_exc: BaseException | None = None
-    for attempt in range(1, retries + 1):
+    attempts = max(1, retries)
+    for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 temp_dest = dest.with_name(f"{dest.name}.part")
@@ -505,13 +631,25 @@ def _sync_download_file(
         except urllib.error.HTTPError as exc:
             last_exc = exc
             if exc.code == 429 or exc.code >= 500:
-                delay = 2**attempt
+                if attempt >= attempts:
+                    raise urllib.error.URLError(
+                        f"Failed to download {url} after {attempts} attempts"
+                    ) from exc
+                retry_after = parse_retry_after(
+                    exc.headers.get("Retry-After") if exc.headers is not None else None
+                )
+                delay = bounded_backoff(
+                    attempt,
+                    base=1.0,
+                    cap=60.0,
+                    retry_after=retry_after,
+                )
                 logger.warning(
-                    "HTTP %d downloading %s (attempt %d/%d), retrying in %ds...",
+                    "HTTP %d downloading %s (attempt %d/%d), retrying in %.1fs...",
                     exc.code,
                     url,
                     attempt,
-                    retries,
+                    attempts,
                     delay,
                 )
                 time.sleep(delay)
@@ -520,12 +658,16 @@ def _sync_download_file(
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_exc = exc
-            delay = 2**attempt
+            if attempt >= attempts:
+                raise urllib.error.URLError(
+                    f"Failed to download {url} after {attempts} attempts"
+                ) from exc
+            delay = bounded_backoff(attempt, base=1.0, cap=60.0)
             logger.warning(
-                "Network error downloading %s (attempt %d/%d): %s, retrying in %ds...",
+                "Network error downloading %s (attempt %d/%d): %s, retrying in %.1fs...",
                 url,
                 attempt,
-                retries,
+                attempts,
                 exc,
                 delay,
             )
@@ -533,7 +675,7 @@ def _sync_download_file(
             continue
 
     # Exhausted all retries.
-    msg = f"Failed to download {url} after {retries} attempts"
+    msg = f"Failed to download {url} after {attempts} attempts"
     raise urllib.error.URLError(msg) from last_exc
 
 
@@ -553,27 +695,57 @@ def _image_extension(url: str) -> str:
 
 def _sync_download_info(
     info: dict[str, Any],
-    opts: dict[str, str | int | bool],
-) -> None:
+    opts: dict[str, Any],
+) -> bool:
     """Download pre-extracted yt-dlp metadata without resolving its URL again."""
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.process_ie_result(info, download=True)
+    outtmpl = opts.get("outtmpl")
+    video_id = str(info.get("id", ""))
+    if not isinstance(outtmpl, str) or not video_id:
+        return False
+    artifact = _find_completed_artifact(Path(outtmpl).parent, video_id)
+    return artifact is not None
 
 
-def _build_ydl_opts(config: ScraperConfig) -> dict[str, str | int | bool]:
+def _find_completed_artifact(output_dir: Path, video_id: str) -> Path | None:
+    """Find a non-temporary, non-empty artifact for a post ID."""
+    if not output_dir.exists():
+        return None
+    for path in output_dir.glob(f"{video_id}.*"):
+        if is_completed_artifact(path) and path.stat().st_size > 0:
+            return path
+    return None
+
+
+def _build_ydl_opts(
+    config: ScraperConfig,
+    *,
+    merge: bool = True,
+) -> dict[str, Any]:
     """Construct the yt-dlp options dictionary."""
     outtmpl = str(config.output_dir / "%(id)s.%(ext)s")
 
-    opts: dict[str, str | int | bool] = {
+    opts: dict[str, Any] = {
         "outtmpl": outtmpl,
-        "format": "bestvideo*+bestaudio/best",
-        "merge_output_format": "mp4",
+        "format": (
+            "bestvideo*+bestaudio/best"
+            if merge
+            else "best[vcodec!=none][acodec!=none]/best"
+        ),
         "quiet": True,
         "no_warnings": True,
         "retries": config.download_retries,
         "fragment_retries": config.download_retries,
         "noprogress": True,
+        # Conservative spacing complements the bounded wrapper backoff.
+        "sleep_interval_requests": config.request_delay,
+        "sleep_interval": config.request_delay,
+        "max_sleep_interval": 2 * config.request_delay,
     }
+
+    if merge:
+        opts["merge_output_format"] = "mp4"
 
     if config.cookies_file is not None:
         opts["cookiefile"] = str(config.cookies_file)

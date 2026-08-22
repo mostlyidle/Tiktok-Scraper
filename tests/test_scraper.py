@@ -13,6 +13,9 @@ from tiktok_scraper.models import VideoInfo
 from tiktok_scraper.scraper import (
     _fetch_via_browser,
     _fetch_via_ytdlp,
+    _is_creator_not_found,
+    _is_retryable_ytdlp,
+    _sync_extract,
     fetch_video_urls,
 )
 
@@ -136,6 +139,54 @@ class TestFetchViaYtdlp:
             pytest.raises(CreatorNotFoundError),
         ):
             await _fetch_via_ytdlp(scraper_config)
+
+    @pytest.mark.asyncio
+    async def test_materializes_lazy_iterable_entries(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """yt-dlp LazyList-like iterables should be retained and consumed."""
+
+        class LazyEntries:
+            def __iter__(self):
+                yield {
+                    "id": "7123456789012345678",
+                    "url": "https://www.tiktok.com/@testuser/video/7123456789012345678",
+                }
+
+        with patch(
+            "tiktok_scraper.scraper._sync_extract",
+            return_value={"entries": LazyEntries()},
+        ):
+            result = await _fetch_via_ytdlp(scraper_config)
+
+        assert [video.video_id for video in result] == ["7123456789012345678"]
+
+    def test_generic_not_found_text_is_not_creator_classification(self) -> None:
+        assert not _is_creator_not_found("HTTP Error 404: Not Found")
+        assert not _is_creator_not_found("Unable to extract video data")
+        assert _is_creator_not_found("This user does not exist")
+
+    def test_generic_404_uses_fallback_without_retry(self) -> None:
+        import yt_dlp
+
+        error = yt_dlp.utils.DownloadError("HTTP Error 404: Not Found")
+        assert not _is_creator_not_found(str(error))
+        assert not _is_retryable_ytdlp(error)
+
+    def test_sync_extract_materializes_lazy_entries(self) -> None:
+        class LazyEntries:
+            def __iter__(self):
+                yield {"id": "7123456789012345678"}
+
+        with patch("tiktok_scraper.scraper.yt_dlp.YoutubeDL") as mock_ydl:
+            mock_ydl.return_value.__enter__.return_value.extract_info.return_value = {
+                "entries": LazyEntries()
+            }
+            result = _sync_extract("https://example.test", {})
+
+        assert isinstance(result, dict)
+        assert result["entries"] == [{"id": "7123456789012345678"}]
 
 
 class TestFetchViaBrowser:

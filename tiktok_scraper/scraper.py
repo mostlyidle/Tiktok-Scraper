@@ -12,17 +12,22 @@ import asyncio
 import functools
 import json
 import logging
+import re
+from collections.abc import Iterable
 from typing import Any
 
 import yt_dlp
 from playwright.async_api import BrowserContext, Page, Response, TimeoutError
+from yt_dlp.utils import DownloadError as YtdlpDownloadError
 
 from tiktok_scraper.config import ScraperConfig
 from tiktok_scraper.exceptions import BrowserError, CreatorNotFoundError
 from tiktok_scraper.models import VideoInfo
 from tiktok_scraper.utils import (
+    bounded_backoff,
     create_stealth_browser_context,
     extract_post_id,
+    parse_retry_after,
     random_delay,
 )
 
@@ -35,6 +40,30 @@ _MAX_STALE_SCROLLS = 5
 _VIDEO_LINK_SELECTOR = 'a[href*="/video/"]'
 _PHOTO_LINK_SELECTOR = 'a[href*="/photo/"]'
 _API_ITEM_LIST_FRAGMENT = "/api/post/item_list/"
+_PERMANENT_YTDLP_ERRORS = (
+    "404",
+    "unsupported url",
+    "private video",
+    "login required",
+    "copyright",
+    "forbidden",
+    "not available",
+)
+_TRANSIENT_YTDLP_ERRORS = (
+    "429",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "temporarily",
+    "timed out",
+    "timeout",
+    "connection",
+    "network",
+    "502",
+    "503",
+    "504",
+    "server error",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +157,9 @@ async def _fetch_via_ytdlp(config: ScraperConfig) -> list[VideoInfo]:
         "quiet": True,
         "no_warnings": True,
         "extract_flat": True,
+        "sleep_interval_requests": config.request_delay,
+        "sleep_interval": config.request_delay,
+        "max_sleep_interval": 2 * config.request_delay,
     }
 
     if config.limit is not None:
@@ -138,22 +170,16 @@ async def _fetch_via_ytdlp(config: ScraperConfig) -> list[VideoInfo]:
 
     loop = asyncio.get_running_loop()
 
-    try:
-        info: dict[str, Any] | None = await loop.run_in_executor(
+    async def _extract() -> dict[str, Any] | None:
+        return await loop.run_in_executor(
             None,
             functools.partial(_sync_extract, profile_url, ydl_opts),
         )
-    except yt_dlp.utils.DownloadError as exc:
-        msg = str(exc).lower()
-        if any(
-            phrase in msg
-            for phrase in (
-                "not found",
-                "404",
-                "does not exist",
-                "unable to extract",
-            )
-        ):
+
+    try:
+        info = await _retry_ytdlp_operation(_extract, config, "discovery")
+    except YtdlpDownloadError as exc:
+        if _is_creator_not_found(str(exc)):
             raise CreatorNotFoundError(config.username) from exc
         raise
 
@@ -161,10 +187,16 @@ async def _fetch_via_ytdlp(config: ScraperConfig) -> list[VideoInfo]:
         return []
 
     videos_by_id: dict[str, VideoInfo] = {}
-    entries = info.get("entries", [])
+    entries = info.get("entries")
+    if entries is None:
+        entries = []
+    elif isinstance(entries, Iterable):
+        entries = list(entries)
+    else:
+        entries = []
 
     for entry in entries:
-        if entry is None:
+        if not isinstance(entry, dict):
             continue
         vid = str(entry.get("id", ""))
         url = entry.get("url", "")
@@ -195,8 +227,80 @@ def _sync_extract(url: str, opts: dict[str, Any]) -> dict[str, Any] | None:
         info = dict(result)
         # Materialize entries eagerly — yt-dlp may return a lazy generator
         # that becomes invalid after the YoutubeDL context manager exits.
-        info["entries"] = list(info.get("entries", []))
+        entries = info.get("entries")
+        if entries is None:
+            info["entries"] = []
+        elif isinstance(entries, Iterable):
+            info["entries"] = list(entries)
+        else:
+            info["entries"] = []
         return info
+
+
+async def _retry_ytdlp_operation(
+    operation: Any,
+    config: ScraperConfig,
+    label: str,
+) -> Any:
+    """Run a yt-dlp operation with bounded adaptive retry spacing."""
+    attempts = max(1, config.download_retries)
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            message = str(exc).lower()
+            if _is_creator_not_found(message) or not _is_retryable_ytdlp(exc):
+                raise
+            if attempt >= attempts:
+                raise
+            retry_after = _retry_after_from_message(message)
+            delay = bounded_backoff(
+                attempt,
+                base=config.retry_backoff_base,
+                cap=config.retry_backoff_max,
+                retry_after=retry_after,
+            )
+            logger.warning(
+                "%s failed (attempt %d/%d): %s; retrying in %.1fs",
+                label.capitalize(),
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise AssertionError("retry loop must return or raise")
+
+
+def _is_creator_not_found(message: str) -> bool:
+    """Recognise creator-not-found errors without broad transient matches."""
+    return any(
+        phrase in message
+        for phrase in (
+            "user does not exist",
+            "this account does not exist",
+            "creator not found",
+            "couldn't find this account",
+        )
+    )
+
+
+def _is_retryable_ytdlp(exc: Exception) -> bool:
+    """Return whether an yt-dlp failure is likely transient."""
+    message = str(exc).lower()
+    if _is_creator_not_found(message) or any(
+        phrase in message for phrase in _PERMANENT_YTDLP_ERRORS
+    ):
+        return False
+    if isinstance(exc, (TimeoutError, OSError, ConnectionError)):
+        return True
+    return any(phrase in message for phrase in _TRANSIENT_YTDLP_ERRORS)
+
+
+def _retry_after_from_message(message: str) -> float | None:
+    """Extract a seconds hint from yt-dlp's human-readable error text."""
+    match = re.search(r"retry[- ]after\s*[:=]?\s*(\d+(?:\.\d+)?)", message)
+    return parse_retry_after(match.group(1)) if match else None
 
 
 # ---------------------------------------------------------------------------

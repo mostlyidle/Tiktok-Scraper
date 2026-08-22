@@ -1,6 +1,8 @@
 """Helpers: video ID extraction, stealth browser setup, rate limiting."""
 
 import asyncio
+import datetime as dt
+import email.utils
 import logging
 import random
 import re
@@ -13,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 _VIDEO_ID_PATTERN = re.compile(r"/video/(\d{15,25})")
 _POST_ID_PATTERN = re.compile(r"/(?:video|photo)/(\d{15,25})")
+_TEMPORARY_SUFFIXES = (".part", ".ytdl", ".tmp")
 
 
 def extract_video_id(url: str) -> str | None:
@@ -56,11 +59,79 @@ def get_downloaded_ids(output_dir: Path) -> set[str]:
         return set()
     ids: set[str] = set()
     for path in output_dir.iterdir():
-        if path.is_file() and path.stem.isdigit():
+        if is_completed_artifact(path) and path.stem.isdigit():
             ids.add(path.stem)
-        elif path.is_dir() and path.name.isdigit():
+        elif is_completed_artifact(path) and path.name.isdigit():
             ids.add(path.name)
     return ids
+
+
+def is_completed_artifact(path: Path) -> bool:
+    """Return whether *path* is a nonempty completed file or directory."""
+    if path.is_file():
+        return (
+            not path.name.lower().endswith(_TEMPORARY_SUFFIXES)
+            and path.stat().st_size > 0
+        )
+    if path.is_dir():
+        return any(is_completed_artifact(child) for child in path.iterdir())
+    return False
+
+
+def cleanup_temporary_artifacts(output_dir: Path) -> None:
+    """Remove stale yt-dlp/image temporary files without touching downloads.
+
+    Slideshow ``.<id>.partial`` directories are intentionally retained: they
+    are the long-standing staging location and are safe because only the
+    numeric directory is considered complete.
+    """
+    if not output_dir.exists():
+        return
+    for staging_dir in output_dir.iterdir():
+        if not staging_dir.is_dir() or not re.fullmatch(
+            r"\.\d{15,25}\.partial", staging_dir.name
+        ):
+            continue
+        for path in staging_dir.rglob("*"):
+            if path.is_file() and path.name.lower().endswith(_TEMPORARY_SUFFIXES):
+                try:
+                    path.unlink()
+                except OSError:
+                    logger.debug("Could not remove stale temporary file %s", path)
+
+
+def parse_retry_after(
+    value: str | None, *, now: dt.datetime | None = None
+) -> float | None:
+    """Parse a Retry-After seconds value or HTTP date."""
+    if not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        try:
+            retry_at = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        current = now or dt.datetime.now(dt.UTC)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=dt.UTC)
+        seconds = (retry_at - current).total_seconds()
+    return max(0.0, seconds)
+
+
+def bounded_backoff(
+    attempt: int,
+    *,
+    base: float = 1.0,
+    cap: float = 60.0,
+    retry_after: float | None = None,
+) -> float:
+    """Return capped exponential backoff with bounded positive jitter."""
+    exponential = min(cap, base * (2 ** max(0, attempt - 1)))
+    floor = exponential if retry_after is None else max(exponential, retry_after)
+    jitter = float(random.uniform(0.0, min(1.0, max(0.0, floor * 0.25))))
+    return float(min(cap, floor + jitter))
 
 
 async def random_delay(min_seconds: float, max_seconds: float) -> None:

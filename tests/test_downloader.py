@@ -14,7 +14,9 @@ from tiktok_scraper.config import ScraperConfig
 from tiktok_scraper.downloader import (
     _build_ydl_opts,
     _extract_image_urls,
+    _find_completed_artifact,
     _has_video_formats,
+    _requires_ffmpeg,
     _sync_download_file,
     _sync_download_info,
     download_videos,
@@ -160,8 +162,8 @@ class TestDownloadVideos:
     ) -> None:
         """Videos whose ID matches an existing file should be skipped."""
         scraper_config.output_dir.mkdir(parents=True, exist_ok=True)
-        (scraper_config.output_dir / "7123456789012345678.mp4").touch()
-        (scraper_config.output_dir / "7123456789012345679.mp4").touch()
+        (scraper_config.output_dir / "7123456789012345678.mp4").write_bytes(b"done")
+        (scraper_config.output_dir / "7123456789012345679.mp4").write_bytes(b"done")
 
         with (
             patch(
@@ -182,7 +184,9 @@ class TestDownloadVideos:
     ) -> None:
         """Photo slideshow directories should count as already downloaded."""
         scraper_config.output_dir.mkdir(parents=True, exist_ok=True)
-        (scraper_config.output_dir / "7123456789012345678").mkdir()
+        photo_dir = scraper_config.output_dir / "7123456789012345678"
+        photo_dir.mkdir()
+        (photo_dir / "image_1.jpg").write_bytes(b"done")
 
         videos = [
             VideoInfo(
@@ -205,7 +209,7 @@ class TestDownloadVideos:
         """When all videos already exist, nothing should be downloaded."""
         scraper_config.output_dir.mkdir(parents=True, exist_ok=True)
         for v in sample_videos:
-            (scraper_config.output_dir / f"{v.video_id}.mp4").touch()
+            (scraper_config.output_dir / f"{v.video_id}.mp4").write_bytes(b"done")
 
         with (
             patch("tiktok_scraper.downloader._sync_extract_info"),
@@ -293,6 +297,62 @@ class TestDownloadVideos:
 
         assert result.failed == 1
         assert result.downloaded == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_ffmpeg_fails_only_when_merge_is_required(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        video = VideoInfo(
+            video_id="7123456789012345678",
+            url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+        )
+        separate_streams = {
+            "id": video.video_id,
+            "formats": [
+                {"vcodec": "h264", "acodec": "none"},
+                {"vcodec": "none", "acodec": "aac"},
+            ],
+        }
+        with (
+            patch(
+                "tiktok_scraper.downloader._sync_extract_info",
+                return_value=separate_streams,
+            ),
+            patch("tiktok_scraper.downloader.check_ffmpeg", return_value=False),
+            patch("tiktok_scraper.downloader._sync_download_info") as mock_download,
+        ):
+            result = await download_videos([video], scraper_config)
+
+        assert result.failed == 1
+        mock_download.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_ffmpeg_uses_progressive_format_when_available(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        video = VideoInfo(
+            video_id="7123456789012345678",
+            url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+        )
+        with (
+            patch(
+                "tiktok_scraper.downloader._sync_extract_info",
+                return_value={
+                    "id": video.video_id,
+                    "formats": [{"vcodec": "h264", "acodec": "aac"}],
+                },
+            ),
+            patch("tiktok_scraper.downloader.check_ffmpeg", return_value=False),
+            patch("tiktok_scraper.downloader._sync_download_info") as mock_download,
+        ):
+            result = await download_videos([video], scraper_config)
+
+        assert result.downloaded == 1
+        opts = mock_download.call_args.args[1]
+        assert opts["format"] == "best[vcodec!=none][acodec!=none]/best"
+        assert "merge_output_format" not in opts
 
     @pytest.mark.asyncio
     async def test_successful_download_counted(
@@ -750,6 +810,47 @@ class TestBuildYdlOpts:
         """cookiefile should not be present when cookies_file is None."""
         opts = _build_ydl_opts(scraper_config)
         assert "cookiefile" not in opts
+
+    def test_ytdlp_options_construct_with_current_version(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """Options must be accepted by the installed yt-dlp API."""
+        import yt_dlp
+
+        opts = _build_ydl_opts(scraper_config)
+        assert "impersonate" not in opts
+        with yt_dlp.YoutubeDL(opts):
+            pass
+
+    def test_progressive_options_do_not_request_a_merge(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        opts = _build_ydl_opts(scraper_config, merge=False)
+        assert "merge_output_format" not in opts
+        assert opts["format"] == "best[vcodec!=none][acodec!=none]/best"
+
+
+class TestArtifactSemantics:
+    """Completed artifacts must be nonempty and never temporary."""
+
+    def test_empty_and_temporary_files_are_not_artifacts(self, tmp_path: Path) -> None:
+        assert _find_completed_artifact(tmp_path, "7123456789012345678") is None
+        (tmp_path / "7123456789012345678.mp4.part").write_bytes(b"partial")
+        (tmp_path / "7123456789012345678.mp4").touch()
+        assert _find_completed_artifact(tmp_path, "7123456789012345678") is None
+
+    def test_requires_ffmpeg_for_separate_streams(self) -> None:
+        assert _requires_ffmpeg(
+            {
+                "formats": [
+                    {"vcodec": "h264", "acodec": "none"},
+                    {"vcodec": "none", "acodec": "aac"},
+                ]
+            }
+        )
+        assert not _requires_ffmpeg({"formats": [{"vcodec": "h264", "acodec": "aac"}]})
 
 
 class TestCheckFfmpeg:

@@ -9,16 +9,16 @@ CLI tool to scrape all videos from a TikTok creator's profile.
 - `--video-only` flag to skip audio-only posts with no video or photo content
 - Automatic resume: skips already-downloaded videos and photo slideshows
 - Concurrent downloads with configurable parallelism
-- Best quality video+audio by default (separate streams merged via ffmpeg)
+- Best quality video+audio by default (separate streams are merged via ffmpeg)
 - Two discovery strategies: yt-dlp (primary) with Playwright browser fallback
 - Cookie support for authenticated sessions
-- Retry logic with exponential backoff for both video and image downloads
+- Bounded exponential backoff with jitter for transient/rate-limit failures
 - Progress logging and detailed summary
 
 ## Requirements
 
 - Python 3.12+
-- [ffmpeg](https://ffmpeg.org/download.html) (required for merging video and audio streams)
+- [ffmpeg](https://ffmpeg.org/download.html) (required when a post needs separate video/audio streams merged)
 - [Playwright](https://playwright.dev/python/) Chromium browser (for fallback discovery)
 
 ## Installation
@@ -33,7 +33,7 @@ python -m venv .venv
 source .venv/bin/activate    # macOS/Linux
 # .venv\Scripts\activate     # Windows
 
-# Install the package with dependencies
+# Install with current yt-dlp TikTok support, curl-cffi, and dev tools
 pip install -e ".[dev]"
 
 # Install ffmpeg (required for merging video and audio streams)
@@ -67,6 +67,9 @@ python -m tiktok_scraper <username>
 ```
 
 The `@` prefix is optional — both `tiktok` and `@tiktok` work.
+
+Usernames may contain letters, numbers, periods, and underscores. `--limit`
+accepts zero or a positive integer; concurrency is always at least one.
 
 ### Options
 
@@ -124,6 +127,14 @@ tiktok-scraper someuser --video-only
 
 Running the same command again automatically skips videos and photo slideshows that have already been downloaded. Videos are detected by filename (e.g. `7123456789012345678.mp4`) and photo slideshows by directory name (e.g. `7123456789012345678/`). This makes it safe to interrupt and restart the scraper.
 
+Existing numeric-ID files and directories are never relocated. Video downloads
+are written as `<id>.<ext>` and slideshow images are staged in
+`.<id>.partial/` before being atomically renamed to `<id>/`. Partial staging
+directories are not considered complete. Stale `.part`, `.ytdl`, and `.tmp`
+files inside slideshow staging directories are removed safely on the next run.
+yt-dlp resume files in the output root are retained and ignored for completion
+detection, while completed files are preserved.
+
 ```bash
 # First run: downloads 50 videos
 tiktok-scraper tiktok --limit 50
@@ -137,13 +148,36 @@ tiktok-scraper tiktok --limit 50
 1. **Video discovery** uses yt-dlp's TikTok extractor as the primary method. It handles TikTok's anti-bot protections natively and is fast and reliable. If yt-dlp fails, a Playwright-based browser fallback scrolls the profile page and collects video and photo URLs via DOM parsing and API response interception.
 
 2. **Content classification** inspects each post's metadata (via yt-dlp's `extract_info`) before downloading. Posts are classified as one of three types:
-   - **Video posts** -- have at least one video stream. Video and audio streams are downloaded separately by yt-dlp and merged into a single `.mp4` file via ffmpeg. This ensures the best quality for both video and audio, since TikTok often serves them as separate streams.
+   - **Video posts** -- have at least one video stream. Separate video and audio streams are merged into a single `.mp4` file via ffmpeg when available; a progressive video+audio format is selected when merging is unnecessary or ffmpeg is unavailable. This avoids incomplete output while retaining the best quality when possible.
    - **Photo slideshows** -- no video stream, but contain image URLs. The individual images are downloaded directly into a `<video_id>/` subdirectory.
    - **Audio-only posts** -- no video stream and no images (typically the audio track of a slideshow). Downloaded via yt-dlp by default, or skipped entirely when `--video-only` is active.
 
-3. **Download execution** runs concurrently (default: 3 at a time) with automatic retry on failure. Video downloads are handled by yt-dlp with configurable retries. Image downloads use `urllib` with exponential backoff on transient HTTP errors (429, 5xx) and network failures.
+3. **Download execution** runs concurrently (default: 3 at a time) with
+   conservative yt-dlp request spacing. Rate limits and transient discovery,
+   metadata, and download failures use bounded exponential backoff with jitter;
+   creator-not-found and permanent failures are not retried. Image downloads
+   retry HTTP 429/5xx and network failures, honor parseable `Retry-After`, and
+   never sleep after the final attempt.
 
-4. **Resume detection** scans the output directory for existing files named `<video_id>.<ext>` and directories named `<video_id>/` (photo slideshows), skipping any content that is already present.
+4. **Resume detection** scans the output directory for existing completed files
+   named `<video_id>.<ext>` and directories named `<video_id>/` (photo
+   slideshows), skipping any content that is already present. Temporary video
+   artifacts are never treated as completed.
+
+### Rate limits and cookies
+
+Keep concurrency modest (the default of 3 is intentional) and avoid repeated
+large runs against the same account. yt-dlp retries are bounded and requests
+are spaced, but TikTok can still rate-limit or challenge automated traffic.
+Cookies are optional and should only be exported from an account you control.
+Use a Netscape-format file, keep it private, never commit it, and do not share
+it: cookies can grant access to the account until they expire or are revoked.
+
+If a post requires separate video and audio streams with no progressive
+fallback, ffmpeg is checked immediately before that post is downloaded. The
+post is reported as failed rather than silently producing incomplete output
+when ffmpeg is unavailable. A successful download also requires a final
+non-temporary artifact.
 
 ## Development
 

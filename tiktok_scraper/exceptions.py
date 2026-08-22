@@ -34,3 +34,10 @@ class BrowserError(ScraperError):
 
     def __init__(self, message: str = "Browser automation failed.") -> None:
         super().__init__(message)
+
+
+class FFmpegError(ScraperError):
+    """Raised when a download needs ffmpeg but it is unavailable."""
+
+    def __init__(self, message: str = "ffmpeg is required for this download.") -> None:
+        super().__init__(message)

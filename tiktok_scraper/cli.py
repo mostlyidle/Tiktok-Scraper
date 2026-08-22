@@ -9,12 +9,11 @@ from pathlib import Path
 
 import click
 
-from tiktok_scraper.config import ScraperConfig
+from tiktok_scraper.config import ScraperConfig, normalize_username
 from tiktok_scraper.downloader import download_videos
 from tiktok_scraper.exceptions import CreatorNotFoundError, ScraperError
 from tiktok_scraper.models import ScrapeResult
 from tiktok_scraper.scraper import fetch_video_urls
-from tiktok_scraper.utils import check_ffmpeg
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -31,8 +30,16 @@ def _setup_logging(verbose: bool) -> None:
     logging.getLogger("playwright").setLevel(logging.WARNING)
 
 
+def _username(_ctx: click.Context, _param: click.Parameter, value: str) -> str:
+    """Click callback that validates USERNAME before starting any work."""
+    try:
+        return normalize_username(value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="USERNAME") from exc
+
+
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
-@click.argument("username")
+@click.argument("username", callback=_username)
 @click.option(
     "-o",
     "--output-dir",
@@ -49,7 +56,7 @@ def _setup_logging(verbose: bool) -> None:
 @click.option(
     "-n",
     "--limit",
-    type=int,
+    type=click.IntRange(min=0),
     default=None,
     help="Maximum number of videos to download.",
 )
@@ -95,26 +102,21 @@ def main(
     _setup_logging(verbose)
     logger = logging.getLogger(__name__)
 
-    check_ffmpeg()
-
-    # Strip leading @ if the user included it.
-    username = username.removeprefix("@")
-
-    if not username:
-        raise click.BadParameter("Username must not be empty.", param_hint="USERNAME")
-
     if output_dir is None:
         output_dir = ScraperConfig.default_output_dir(username)
 
-    config = ScraperConfig(
-        username=username,
-        output_dir=output_dir,
-        cookies_file=cookies,
-        limit=limit,
-        headless=headless,
-        max_concurrent_downloads=concurrency,
-        video_only=video_only,
-    )
+    try:
+        config = ScraperConfig(
+            username=username,
+            output_dir=output_dir,
+            cookies_file=cookies,
+            limit=limit,
+            headless=headless,
+            max_concurrent_downloads=concurrency,
+            video_only=video_only,
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="USERNAME") from exc
 
     logger.info("Starting scrape for @%s", username)
     logger.info("Output directory: %s", config.output_dir)

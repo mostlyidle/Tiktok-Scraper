@@ -32,6 +32,19 @@ class TestCli:
         result = cli_runner.invoke(main, [])
         assert result.exit_code != 0
 
+    @pytest.mark.parametrize("username", [".", "..", "bad user", "a/b"])
+    def test_rejects_unsafe_username(
+        self,
+        cli_runner: CliRunner,
+        username: str,
+    ) -> None:
+        result = cli_runner.invoke(main, [username])
+        assert result.exit_code != 0
+
+    def test_rejects_negative_limit(self, cli_runner: CliRunner) -> None:
+        result = cli_runner.invoke(main, ["testuser", "--limit", "-1"])
+        assert result.exit_code != 0
+
     def test_strips_at_sign(self, cli_runner: CliRunner) -> None:
         """Leading @ should be stripped from the username."""
         mock_result = ScrapeResult(
