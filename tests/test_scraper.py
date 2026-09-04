@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,13 +12,27 @@ from tiktok_scraper.config import ScraperConfig
 from tiktok_scraper.exceptions import CreatorNotFoundError
 from tiktok_scraper.models import VideoInfo
 from tiktok_scraper.scraper import (
+    _attach_api_interceptor,
+    _extract_embed_channel_id,
+    _extract_embed_profile_post_ids,
     _fetch_via_browser,
+    _fetch_via_embed_channel,
     _fetch_via_ytdlp,
     _is_creator_not_found,
     _is_retryable_ytdlp,
     _sync_extract,
     fetch_video_urls,
 )
+
+
+def _frontity_html(route: str, data: dict[str, object]) -> str:
+    """Build a minimal Frontity state script for parser tests."""
+    state = {"source": {"data": {route: data}}}
+    return (
+        '<script id="__FRONTITY_CONNECT_STATE__" type="application/json">'
+        f"{json.dumps(state)}"
+        "</script>"
+    )
 
 
 class TestFetchViaYtdlp:
@@ -222,6 +237,172 @@ class TestFetchViaYtdlp:
 
         assert isinstance(result, dict)
         assert result["entries"] == [{"id": "7123456789012345678"}]
+
+
+class TestEmbedDiscovery:
+    """Tests for the embed-based channel-ID discovery fallback."""
+
+    def test_extracts_profile_post_ids_from_frontity_state(self) -> None:
+        html = _frontity_html(
+            "/embed/@testuser",
+            {
+                "videoList": [
+                    {"id": "7123456789012345678"},
+                    {"id": "7123456789012345679"},
+                ]
+            },
+        )
+
+        assert _extract_embed_profile_post_ids(html, "testuser") == [
+            "7123456789012345678",
+            "7123456789012345679",
+        ]
+
+    def test_extracts_channel_id_from_video_embed(self) -> None:
+        channel_id = (
+            "MS4wLjABAAAAX2WwIM9zaUvOw_9bZbYJeGD7AAlYmxEkHfP7SNKrO505N-kjp87vNzjY0hG-HZqd"
+        )
+        html = _frontity_html(
+            "/embed/v2/7123456789012345678",
+            {"videoData": {"authorInfos": {"secUid": channel_id}}},
+        )
+
+        assert _extract_embed_channel_id(html, "7123456789012345678") == channel_id
+
+    @pytest.mark.asyncio
+    async def test_resolves_channel_id_and_uses_ytdlp_channel_route(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        channel_id = (
+            "MS4wLjABAAAAX2WwIM9zaUvOw_9bZbYJeGD7AAlYmxEkHfP7SNKrO505N-kjp87vNzjY0hG-HZqd"
+        )
+        config = ScraperConfig(
+            username="testuser",
+            output_dir=tmp_path / "downloads",
+            request_delay=0.0,
+        )
+        profile_html = _frontity_html(
+            "/embed/@testuser",
+            {"videoList": [{"id": "7123456789012345678"}]},
+        )
+        video_html = _frontity_html(
+            "/embed/v2/7123456789012345678",
+            {"videoData": {"authorInfos": {"secUid": channel_id}}},
+        )
+        expected = [
+            VideoInfo(
+                video_id="7123456789012345678",
+                url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+            )
+        ]
+
+        with (
+            patch(
+                "tiktok_scraper.scraper._sync_fetch_embed_html",
+                side_effect=[profile_html, video_html],
+            ) as mock_fetch,
+            patch(
+                "tiktok_scraper.scraper._fetch_via_ytdlp_channel",
+                new=AsyncMock(return_value=expected),
+            ) as mock_channel,
+        ):
+            result = await _fetch_via_embed_channel(config)
+
+        assert result == expected
+        assert mock_fetch.call_count == 2
+        mock_channel.assert_awaited_once_with(config, channel_id)
+
+    @pytest.mark.asyncio
+    async def test_profile_discovery_falls_back_to_embed_channel_route(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        import yt_dlp
+
+        expected = [
+            VideoInfo(
+                video_id="7123456789012345678",
+                url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+            )
+        ]
+        with (
+            patch(
+                "tiktok_scraper.scraper._sync_extract",
+                side_effect=yt_dlp.utils.DownloadError(
+                    "Unable to extract secondary user ID"
+                ),
+            ),
+            patch(
+                "tiktok_scraper.scraper._fetch_via_embed_channel",
+                new=AsyncMock(return_value=expected),
+            ) as mock_embed,
+        ):
+            result = await _fetch_via_ytdlp(scraper_config)
+
+        assert result == expected
+        mock_embed.assert_awaited_once_with(scraper_config)
+
+    @pytest.mark.asyncio
+    async def test_profile_embed_can_use_existing_downloaded_post(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        channel_id = (
+            "MS4wLjABAAAAX2WwIM9zaUvOw_9bZbYJeGD7AAlYmxEkHfP7SNKrO505N-kjp87vNzjY0hG-HZqd"
+        )
+        config = ScraperConfig(
+            username="testuser",
+            output_dir=tmp_path / "downloads",
+            request_delay=0.0,
+        )
+        config.output_dir.mkdir()
+        (config.output_dir / "7123456789012345678.mp4").write_bytes(b"video")
+        video_html = _frontity_html(
+            "/embed/v2/7123456789012345678",
+            {"videoData": {"authorInfos": {"secUid": channel_id}}},
+        )
+
+        with (
+            patch(
+                "tiktok_scraper.scraper._sync_fetch_embed_html",
+                side_effect=[RuntimeError("profile embed unavailable"), video_html],
+            ) as mock_fetch,
+            patch(
+                "tiktok_scraper.scraper._fetch_via_ytdlp_channel",
+                new=AsyncMock(return_value=[]),
+            ) as mock_channel,
+        ):
+            await _fetch_via_embed_channel(config)
+
+        assert mock_fetch.call_count == 2
+        mock_channel.assert_awaited_once_with(config, channel_id)
+
+
+class TestApiInterception:
+    """Tests for current and legacy TikTok item-list endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_accepts_creator_item_list_endpoint(self) -> None:
+        videos_by_id: dict[str, VideoInfo] = {}
+        page = MagicMock()
+        _attach_api_interceptor(page, videos_by_id)
+        callback = page.on.call_args.args[1]
+        response = AsyncMock()
+        response.url = "https://www.tiktok.com/api/creator/item_list/"
+        response.body.return_value = json.dumps(
+            {
+                "itemList": [
+                    {"id": "7123456789012345678", "author": {"uniqueId": "testuser"}}
+                ]
+            }
+        ).encode()
+
+        await callback(response)
+
+        assert videos_by_id["7123456789012345678"].url.endswith(
+            "/@testuser/video/7123456789012345678"
+        )
 
 
 class TestFetchViaBrowser:

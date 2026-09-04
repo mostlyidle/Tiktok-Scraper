@@ -149,7 +149,7 @@ tiktok-scraper tiktok --limit 50
 
 ## How it works
 
-1. **Video discovery** uses yt-dlp's TikTok extractor as the primary method. It handles TikTok's anti-bot protections natively and is fast and reliable. If yt-dlp fails, a Playwright-based browser fallback scrolls the profile page and collects video and photo URLs via DOM parsing and API response interception.
+1. **Video discovery** uses yt-dlp's TikTok extractor as the primary method. It handles TikTok's anti-bot protections natively and is fast and reliable. If TikTok blocks profile hydration, the scraper fetches profile/video embed data to recover the account's secondary user ID, then retries discovery through yt-dlp's `tiktokuser:<channel_id>` route. If that also fails, a Playwright-based browser fallback scrolls the profile page and collects video and photo URLs via DOM parsing and API response interception.
 
 2. **Content classification** inspects each post's metadata (via yt-dlp's `extract_info`) before downloading. Posts are classified as one of three types:
    - **Video posts** -- have at least one video stream. Separate video and audio streams are merged into a single `.mp4` file via ffmpeg when available; a progressive video+audio format is selected when merging is unnecessary or ffmpeg is unavailable. This avoids incomplete output while retaining the best quality when possible.

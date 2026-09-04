@@ -14,9 +14,11 @@ import json
 import logging
 import re
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import yt_dlp
+from curl_cffi import requests as curl_requests
 from playwright.async_api import BrowserContext, Page, Response, TimeoutError
 from yt_dlp.networking.impersonate import ImpersonateTarget
 from yt_dlp.utils import DownloadError as YtdlpDownloadError
@@ -28,6 +30,7 @@ from tiktok_scraper.utils import (
     bounded_backoff,
     create_stealth_browser_context,
     extract_post_id,
+    get_downloaded_ids,
     parse_retry_after,
     random_delay,
 )
@@ -54,7 +57,16 @@ _MAX_STALE_SCROLLS = 5
 # Selectors / URL fragments used to identify video links (browser fallback).
 _VIDEO_LINK_SELECTOR = 'a[href*="/video/"]'
 _PHOTO_LINK_SELECTOR = 'a[href*="/photo/"]'
-_API_ITEM_LIST_FRAGMENT = "/api/post/item_list/"
+_API_ITEM_LIST_FRAGMENTS = (
+    "/api/post/item_list/",
+    "/api/creator/item_list/",
+)
+_FRONTITY_STATE_PATTERN = re.compile(
+    r'<script[^>]+id=["\']__FRONTITY_CONNECT_STATE__["\'][^>]*>'
+    r"(?P<data>.*?)</script>",
+    re.DOTALL | re.IGNORECASE,
+)
+_MAX_EMBED_POST_PROBES = 8
 _PERMANENT_YTDLP_ERRORS = (
     "404",
     "unsupported url",
@@ -170,23 +182,7 @@ async def _fetch_via_ytdlp(config: ScraperConfig) -> list[VideoInfo]:
     profile_url = f"https://www.tiktok.com/@{config.username}"
     logger.info("Discovering videos via yt-dlp for %s", profile_url)
 
-    ydl_opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "logger": _YTDLP_LOGGER,
-        "extract_flat": True,
-        "sleep_interval_requests": config.request_delay,
-        "sleep_interval": config.request_delay,
-        "max_sleep_interval": 2 * config.request_delay,
-        "impersonate": _IMPERSONATE_CHROME,
-        "extractor_retries": config.download_retries,
-    }
-
-    if config.limit is not None:
-        ydl_opts["playlistend"] = config.limit
-
-    if config.cookies_file is not None:
-        ydl_opts["cookiefile"] = str(config.cookies_file)
+    ydl_opts = _build_discovery_opts(config)
 
     loop = asyncio.get_running_loop()
 
@@ -201,11 +197,88 @@ async def _fetch_via_ytdlp(config: ScraperConfig) -> list[VideoInfo]:
     except YtdlpDownloadError as exc:
         if _is_creator_not_found(str(exc)):
             raise CreatorNotFoundError(config.username) from exc
+        logger.warning(
+            "yt-dlp profile discovery failed for @%s: %s. "
+            "Trying embed/channel fallback.",
+            config.username,
+            exc,
+        )
+        try:
+            fallback_videos = await _fetch_via_embed_channel(config)
+        except Exception as fallback_exc:
+            logger.debug("Embed/channel fallback failed.", exc_info=True)
+            raise exc from fallback_exc
+        if fallback_videos:
+            return fallback_videos
         raise
 
     if info is None:
         return []
 
+    all_videos = _video_infos_from_info(info, config.limit)
+
+    logger.info(
+        "yt-dlp discovered %d videos for @%s.",
+        len(all_videos),
+        config.username,
+    )
+    return all_videos
+
+
+async def _fetch_via_ytdlp_channel(
+    config: ScraperConfig,
+    channel_id: str,
+) -> list[VideoInfo]:
+    """Discover posts through yt-dlp's stable secondary-user-ID route."""
+    channel_url = f"tiktokuser:{channel_id}"
+    logger.info("Discovering videos via TikTok channel ID for @%s", config.username)
+    ydl_opts = _build_discovery_opts(config)
+    loop = asyncio.get_running_loop()
+
+    async def _extract() -> dict[str, Any] | None:
+        return await loop.run_in_executor(
+            None,
+            functools.partial(_sync_extract, channel_url, ydl_opts),
+        )
+
+    info = await _retry_ytdlp_operation(_extract, config, "channel discovery")
+    if info is None:
+        return []
+
+    videos = _video_infos_from_info(info, config.limit)
+    logger.info(
+        "Channel-ID discovery found %d videos for @%s.",
+        len(videos),
+        config.username,
+    )
+    return videos
+
+
+def _build_discovery_opts(config: ScraperConfig) -> dict[str, Any]:
+    """Construct yt-dlp options shared by profile and channel discovery."""
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _YTDLP_LOGGER,
+        "extract_flat": True,
+        "sleep_interval_requests": config.request_delay,
+        "sleep_interval": config.request_delay,
+        "max_sleep_interval": 2 * config.request_delay,
+        "impersonate": _IMPERSONATE_CHROME,
+        "extractor_retries": config.download_retries,
+    }
+    if config.limit is not None:
+        opts["playlistend"] = config.limit
+    if config.cookies_file is not None:
+        opts["cookiefile"] = str(config.cookies_file)
+    return opts
+
+
+def _video_infos_from_info(
+    info: dict[str, Any],
+    limit: int | None,
+) -> list[VideoInfo]:
+    """Convert a yt-dlp playlist result into deduplicated post records."""
     videos_by_id: dict[str, VideoInfo] = {}
     entries = info.get("entries")
     if entries is None:
@@ -226,15 +299,8 @@ async def _fetch_via_ytdlp(config: ScraperConfig) -> list[VideoInfo]:
             videos_by_id[vid] = VideoInfo(video_id=vid, url=url)
 
     all_videos = sorted(videos_by_id.values(), key=lambda v: v.video_id)
-
-    if config.limit is not None:
-        all_videos = all_videos[: config.limit]
-
-    logger.info(
-        "yt-dlp discovered %d videos for @%s.",
-        len(all_videos),
-        config.username,
-    )
+    if limit is not None:
+        all_videos = all_videos[:limit]
     return all_videos
 
 
@@ -255,6 +321,165 @@ def _sync_extract(url: str, opts: dict[str, Any]) -> dict[str, Any] | None:
         else:
             info["entries"] = []
         return info
+
+
+async def _fetch_via_embed_channel(config: ScraperConfig) -> list[VideoInfo]:
+    """Discover posts through the profile embed's secondary user ID.
+
+    The normal TikTok profile extractor needs a post page to resolve the
+    account's ``secUid``.  TikTok's embed pages expose that value separately,
+    so this path can recover when the normal profile pages are WAF-challenged.
+    """
+    loop = asyncio.get_running_loop()
+    profile_url = f"https://www.tiktok.com/embed/@{config.username}"
+    post_ids: list[str] = []
+
+    try:
+        profile_html = await loop.run_in_executor(
+            None,
+            functools.partial(_sync_fetch_embed_html, profile_url, config.cookies_file),
+        )
+        post_ids.extend(_extract_embed_profile_post_ids(profile_html, config.username))
+    except Exception as exc:
+        logger.debug("TikTok profile embed discovery failed: %s", exc)
+
+    # Previously downloaded posts are useful when the profile embed is also
+    # temporarily challenged.  Only a small number are needed to resolve secUid.
+    post_ids.extend(sorted(get_downloaded_ids(config.output_dir), reverse=True))
+    post_ids = list(dict.fromkeys(post_ids))[:_MAX_EMBED_POST_PROBES]
+    if not post_ids:
+        logger.warning("TikTok embed returned no candidate posts for @%s.", config.username)
+        return []
+
+    channel_id: str | None = None
+    for attempt, post_id in enumerate(post_ids):
+        if attempt and config.request_delay:
+            await asyncio.sleep(config.request_delay)
+        video_url = f"https://www.tiktok.com/embed/v2/{post_id}"
+        try:
+            video_html = await loop.run_in_executor(
+                None,
+                functools.partial(_sync_fetch_embed_html, video_url, config.cookies_file),
+            )
+            channel_id = _extract_embed_channel_id(video_html, post_id)
+        except Exception as exc:
+            logger.debug("TikTok post embed lookup failed for %s: %s", post_id, exc)
+        if channel_id:
+            break
+
+    if channel_id is None:
+        logger.warning("Could not resolve a TikTok channel ID for @%s.", config.username)
+        return []
+
+    logger.info("Resolved TikTok channel ID for @%s via embed data.", config.username)
+    return await _fetch_via_ytdlp_channel(config, channel_id)
+
+
+def _sync_fetch_embed_html(url: str, cookies_file: Path | None) -> str:
+    """Fetch a TikTok embed page using Chrome TLS impersonation."""
+    response = curl_requests.get(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.tiktok.com/",
+        },
+        cookies=_read_netscape_cookie_pairs(cookies_file),
+        impersonate="chrome",
+        timeout=30,
+    )
+    response.raise_for_status()  # type: ignore[no-untyped-call]
+    return response.text
+
+
+def _read_netscape_cookie_pairs(cookies_file: Path | None) -> dict[str, str]:
+    """Read cookie name/value pairs from an optional Netscape cookie file."""
+    if cookies_file is None or not cookies_file.exists():
+        return {}
+
+    cookies: dict[str, str] = {}
+    with cookies_file.open(encoding="utf-8") as cookie_stream:
+        for line in cookie_stream:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies[parts[5]] = parts[6]
+    return cookies
+
+
+def _parse_frontity_state(html: str) -> dict[str, Any] | None:
+    """Parse TikTok's Frontity hydration state from an embed page."""
+    match = _FRONTITY_STATE_PATTERN.search(html)
+    if match is None:
+        return None
+    try:
+        state = json.loads(match.group("data"))
+    except json.JSONDecodeError:
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _extract_embed_profile_post_ids(html: str, username: str) -> list[str]:
+    """Extract ordered post IDs from a profile embed response."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    state = _parse_frontity_state(html)
+    if state is not None:
+        source = state.get("source")
+        data = source.get("data") if isinstance(source, dict) else None
+        profile = data.get(f"/embed/@{username}") if isinstance(data, dict) else None
+        video_list = profile.get("videoList", []) if isinstance(profile, dict) else []
+        if isinstance(video_list, list):
+            for item in video_list:
+                if isinstance(item, dict):
+                    post_id = str(item.get("id", ""))
+                    if post_id.isdigit() and post_id not in seen:
+                        seen.add(post_id)
+                        ids.append(post_id)
+
+    link_pattern = re.compile(
+        rf"/@{re.escape(username)}/(?:video|photo)/(\d{{15,25}})",
+        re.IGNORECASE,
+    )
+    for match in link_pattern.finditer(html):
+        post_id = match.group(1)
+        if post_id not in seen:
+            seen.add(post_id)
+            ids.append(post_id)
+    return ids
+
+
+def _extract_embed_channel_id(html: str, video_id: str) -> str | None:
+    """Extract a TikTok ``secUid`` from a video embed response."""
+    state = _parse_frontity_state(html)
+    if state is None:
+        return None
+    source = state.get("source")
+    data = source.get("data") if isinstance(source, dict) else None
+    video = data.get(f"/embed/v2/{video_id}") if isinstance(data, dict) else None
+    channel_id = _find_nested_channel_id(video)
+    return channel_id
+
+
+def _find_nested_channel_id(value: Any) -> str | None:
+    """Find a valid secondary user ID in nested embed JSON."""
+    if isinstance(value, dict):
+        for key in ("secUid", "sec_uid", "channel_id", "channelId"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.startswith("MS4wLjAB"):
+                return candidate
+        for child in value.values():
+            channel_id = _find_nested_channel_id(child)
+            if channel_id:
+                return channel_id
+    elif isinstance(value, list):
+        for child in value:
+            channel_id = _find_nested_channel_id(child)
+            if channel_id:
+                return channel_id
+    return None
 
 
 async def _retry_ytdlp_operation(
@@ -335,7 +560,7 @@ async def _fetch_via_browser(
     """Scroll through a TikTok profile page and collect video URLs.
 
     Uses two complementary sub-strategies:
-      1. **Network interception** — captures ``/api/post/item_list/`` JSON
+      1. **Network interception** — captures TikTok creator/post item-list JSON
          responses as the page scrolls, yielding structured video data.
       2. **DOM parsing** — queries the rendered page for ``<a>`` tags that
          link to ``/video/`` paths.
@@ -545,10 +770,10 @@ def _attach_api_interceptor(
     page: Page,
     videos_by_id: dict[str, VideoInfo],
 ) -> None:
-    """Listen for ``/api/post/item_list/`` responses and extract video data."""
+    """Listen for TikTok item-list responses and extract video data."""
 
     async def _on_response(response: Response) -> None:
-        if _API_ITEM_LIST_FRAGMENT not in response.url:
+        if not any(fragment in response.url for fragment in _API_ITEM_LIST_FRAGMENTS):
             return
         try:
             body = await response.body()
