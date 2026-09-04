@@ -6,17 +6,19 @@ import io
 import logging
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tiktok_scraper.config import ScraperConfig
 from tiktok_scraper.downloader import (
+    _build_embed_ydl_opts,
     _build_ydl_opts,
     _extract_image_urls,
     _find_completed_artifact,
     _has_video_formats,
     _requires_ffmpeg,
+    _sync_download_embed,
     _sync_download_file,
     _sync_download_info,
     download_videos,
@@ -269,6 +271,14 @@ class TestDownloadVideos:
                 "tiktok_scraper.downloader._sync_download_info",
                 side_effect=RuntimeError("network error"),
             ),
+            patch(
+                "tiktok_scraper.downloader._sync_download_embed",
+                side_effect=RuntimeError("embed error"),
+            ),
+            patch(
+                "tiktok_scraper.downloader.asyncio.sleep",
+                new=AsyncMock(),
+            ),
         ):
             result = await download_videos(videos, scraper_config)
 
@@ -289,9 +299,19 @@ class TestDownloadVideos:
             ),
         ]
 
-        with patch(
-            "tiktok_scraper.downloader._sync_extract_info",
-            side_effect=RuntimeError("extraction error"),
+        with (
+            patch(
+                "tiktok_scraper.downloader._sync_extract_info",
+                side_effect=RuntimeError("extraction error"),
+            ),
+            patch(
+                "tiktok_scraper.downloader._sync_download_embed",
+                side_effect=RuntimeError("embed error"),
+            ),
+            patch(
+                "tiktok_scraper.downloader.asyncio.sleep",
+                new=AsyncMock(),
+            ),
         ):
             result = await download_videos(videos, scraper_config)
 
@@ -353,6 +373,84 @@ class TestDownloadVideos:
         opts = mock_download.call_args.args[1]
         assert opts["format"] == "best[vcodec!=none][acodec!=none]/best"
         assert "merge_output_format" not in opts
+    @pytest.mark.asyncio
+    async def test_uses_embed_fallback_after_extract_failure(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """A failed post extraction should fall back to TikTok's embed page."""
+        videos = [
+            VideoInfo(
+                video_id="7123456789012345678",
+                url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+            ),
+        ]
+
+        def save_embed(_video_id: str, opts: dict[str, object]) -> None:
+            Path(str(opts["outtmpl"])).write_bytes(b"video")
+
+        with (
+            patch(
+                "tiktok_scraper.downloader._sync_extract_info",
+                side_effect=RuntimeError("extraction error"),
+            ) as mock_extract,
+            patch(
+                "tiktok_scraper.downloader._sync_download_embed",
+                side_effect=save_embed,
+            ) as mock_embed,
+        ):
+            result = await download_videos(videos, scraper_config)
+
+        assert result.downloaded == 1
+        assert result.failed == 0
+        mock_extract.assert_called_once()
+        mock_embed.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_post_retries_counts_as_failure(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """A post should fail after exhausting configured retry attempts."""
+        videos = [
+            VideoInfo(
+                video_id="7123456789012345678",
+                url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+            ),
+        ]
+        config = ScraperConfig(
+            username=scraper_config.username,
+            output_dir=scraper_config.output_dir,
+            cookies_file=scraper_config.cookies_file,
+            limit=scraper_config.limit,
+            headless=scraper_config.headless,
+            max_concurrent_downloads=scraper_config.max_concurrent_downloads,
+            scroll_delay_min=scraper_config.scroll_delay_min,
+            scroll_delay_max=scraper_config.scroll_delay_max,
+            download_retries=2,
+            video_only=scraper_config.video_only,
+        )
+
+        with (
+            patch(
+                "tiktok_scraper.downloader._sync_extract_info",
+                side_effect=RuntimeError("still failing"),
+            ) as mock_extract,
+            patch(
+                "tiktok_scraper.downloader._sync_download_embed",
+                side_effect=RuntimeError("embed error"),
+            ),
+            patch(
+                "tiktok_scraper.downloader.asyncio.sleep",
+                new=AsyncMock(),
+            ) as mock_sleep,
+        ):
+            result = await download_videos(videos, config)
+
+        assert result.failed == 1
+        assert result.downloaded == 0
+        assert mock_extract.call_count == 2
+        mock_sleep.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_successful_download_counted(
@@ -383,6 +481,43 @@ class TestDownloadVideos:
         assert result.downloaded == 2
         assert result.failed == 0
         assert result.total_found == 2
+
+    @pytest.mark.asyncio
+    async def test_uses_embed_fallback_after_video_download_failure(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """A failed primary video download should use the embed source."""
+        videos = [
+            VideoInfo(
+                video_id="7123456789012345678",
+                url="https://www.tiktok.com/@testuser/video/7123456789012345678",
+            ),
+        ]
+
+        def save_embed(_video_id: str, opts: dict[str, object]) -> None:
+            Path(str(opts["outtmpl"])).write_bytes(b"video")
+
+        with (
+            patch(
+                "tiktok_scraper.downloader._sync_extract_info",
+                return_value=_VIDEO_INFO,
+            ),
+            patch(
+                "tiktok_scraper.downloader._sync_download_info",
+                side_effect=RuntimeError("primary download error"),
+            ) as mock_download,
+            patch(
+                "tiktok_scraper.downloader._sync_download_embed",
+                side_effect=save_embed,
+            ) as mock_embed,
+        ):
+            result = await download_videos(videos, scraper_config)
+
+        assert result.downloaded == 1
+        assert result.failed == 0
+        mock_download.assert_called_once()
+        mock_embed.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_result_summary(
@@ -772,6 +907,21 @@ class TestPreExtractedDownload:
         ydl.extract_info.assert_not_called()
 
 
+class TestEmbedFallback:
+    """Tests for the TikTok embed download fallback."""
+
+    def test_downloads_first_embed_source(self) -> None:
+        opts = {"quiet": True}
+        with patch("tiktok_scraper.downloader.yt_dlp.YoutubeDL") as mock_ydl:
+            ydl = mock_ydl.return_value.__enter__.return_value
+            _sync_download_embed("7123456789012345678", opts)
+
+        ydl.extract_info.assert_called_once_with(
+            "https://www.tiktok.com/embed/v2/7123456789012345678",
+            download=True,
+        )
+
+
 class TestBuildYdlOpts:
     """Tests for :func:`_build_ydl_opts` yt-dlp option construction."""
 
@@ -819,7 +969,7 @@ class TestBuildYdlOpts:
         import yt_dlp
 
         opts = _build_ydl_opts(scraper_config)
-        assert "impersonate" not in opts
+        assert str(opts["impersonate"]) == "chrome"
         with yt_dlp.YoutubeDL(opts):
             pass
 
@@ -830,6 +980,28 @@ class TestBuildYdlOpts:
         opts = _build_ydl_opts(scraper_config, merge=False)
         assert "merge_output_format" not in opts
         assert opts["format"] == "best[vcodec!=none][acodec!=none]/best"
+
+    def test_extractor_retries_match_config(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """Extractor retries should follow the configured retry count."""
+        opts = _build_ydl_opts(scraper_config)
+        assert opts["extractor_retries"] == scraper_config.download_retries
+
+    def test_embed_fallback_uses_one_fixed_mp4_output(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """The embed page's duplicate source should be downloaded only once."""
+        video_id = "7123456789012345678"
+        opts = _build_embed_ydl_opts(scraper_config, video_id)
+
+        assert opts["outtmpl"] == str(scraper_config.output_dir / f"{video_id}.mp4")
+        assert opts["playlistend"] == 1
+        assert opts["continuedl"] is False
+        assert opts["overwrites"] is True
+        assert str(opts["impersonate"]) == "chrome"
 
 
 class TestArtifactSemantics:

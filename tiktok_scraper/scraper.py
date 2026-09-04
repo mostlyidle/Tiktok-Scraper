@@ -18,6 +18,7 @@ from typing import Any
 
 import yt_dlp
 from playwright.async_api import BrowserContext, Page, Response, TimeoutError
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from yt_dlp.utils import DownloadError as YtdlpDownloadError
 
 from tiktok_scraper.config import ScraperConfig
@@ -32,6 +33,20 @@ from tiktok_scraper.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _YtdlpLogger:
+    """Route yt-dlp output through this module's logger."""
+
+    def debug(self, message: str) -> None:
+        logger.debug("yt-dlp: %s", message)
+
+    def warning(self, message: str) -> None:
+        logger.debug("yt-dlp: %s", message)
+
+    def error(self, message: str) -> None:
+        logger.debug("yt-dlp: %s", message)
+
 
 # Maximum consecutive scrolls with no new videos before we stop (browser fallback).
 _MAX_STALE_SCROLLS = 5
@@ -64,6 +79,8 @@ _TRANSIENT_YTDLP_ERRORS = (
     "504",
     "server error",
 )
+_IMPERSONATE_CHROME = ImpersonateTarget.from_str("chrome")
+_YTDLP_LOGGER = _YtdlpLogger()
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +173,13 @@ async def _fetch_via_ytdlp(config: ScraperConfig) -> list[VideoInfo]:
     ydl_opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "logger": _YTDLP_LOGGER,
         "extract_flat": True,
         "sleep_interval_requests": config.request_delay,
         "sleep_interval": config.request_delay,
         "max_sleep_interval": 2 * config.request_delay,
+        "impersonate": _IMPERSONATE_CHROME,
+        "extractor_retries": config.download_retries,
     }
 
     if config.limit is not None:
@@ -199,7 +219,7 @@ async def _fetch_via_ytdlp(config: ScraperConfig) -> list[VideoInfo]:
         if not isinstance(entry, dict):
             continue
         vid = str(entry.get("id", ""))
-        url = entry.get("url", "")
+        url = str(entry.get("url", ""))
         if not vid or not url:
             continue
         if vid not in videos_by_id:

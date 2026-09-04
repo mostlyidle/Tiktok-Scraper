@@ -82,6 +82,41 @@ class TestFetchViaYtdlp:
         assert len(result) <= 1
 
     @pytest.mark.asyncio
+    async def test_sets_playlistend_from_limit(self, tmp_path: Path) -> None:
+        """Should pass playlistend when a limit is configured."""
+        config = ScraperConfig(
+            username="testuser",
+            output_dir=tmp_path / "downloads",
+            limit=7,
+            scroll_delay_min=0.0,
+            scroll_delay_max=0.0,
+        )
+        with patch(
+            "tiktok_scraper.scraper._sync_extract",
+            return_value={"entries": []},
+        ) as mock_extract:
+            await _fetch_via_ytdlp(config)
+
+        _url, opts = mock_extract.call_args.args
+        assert opts["playlistend"] == 7
+
+    @pytest.mark.asyncio
+    async def test_enables_impersonation_and_extractor_retries(
+        self,
+        scraper_config: ScraperConfig,
+    ) -> None:
+        """Should enable yt-dlp TikTok impersonation and extractor retries."""
+        with patch(
+            "tiktok_scraper.scraper._sync_extract",
+            return_value={"entries": []},
+        ) as mock_extract:
+            await _fetch_via_ytdlp(scraper_config)
+
+        _url, opts = mock_extract.call_args.args
+        assert str(opts["impersonate"]) == "chrome"
+        assert opts["extractor_retries"] == scraper_config.download_retries
+
+    @pytest.mark.asyncio
     async def test_deduplicates_videos(
         self,
         scraper_config: ScraperConfig,

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from tiktok_scraper.config import ScraperConfig
 from tiktok_scraper.models import ScrapeResult, VideoInfo
@@ -27,8 +28,25 @@ from tiktok_scraper.utils import (
 
 logger = logging.getLogger(__name__)
 
+
+class _YtdlpLogger:
+    """Route yt-dlp output through this module's logger."""
+
+    def debug(self, message: str) -> None:
+        logger.debug("yt-dlp: %s", message)
+
+    def warning(self, message: str) -> None:
+        logger.debug("yt-dlp: %s", message)
+
+    def error(self, message: str) -> None:
+        logger.debug("yt-dlp: %s", message)
+
+
 _MAX_CONCURRENT_IMAGE_DOWNLOADS = 3
 _DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+_POST_RETRY_INITIAL_DELAY_SECONDS = 1
+_IMPERSONATE_CHROME = ImpersonateTarget.from_str("chrome")
+_YTDLP_LOGGER = _YtdlpLogger()
 
 
 class _DownloadOutcome(enum.Enum):
@@ -164,6 +182,57 @@ async def _download_single(
     total: int,
     image_semaphore: asyncio.Semaphore,
 ) -> _DownloadOutcome:
+    """Download a single post with retry/backoff around the full workflow.
+
+    Retries re-run metadata extraction and download from scratch, which helps
+    recover from transient TikTok and network failures.
+
+    Returns:
+        The final outcome after all attempts.
+    """
+    max_attempts = max(1, config.download_retries)
+
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            delay = _post_retry_delay_seconds(attempt - 1)
+            logger.warning(
+                "[%d/%d] Retrying %s (attempt %d/%d) in %ds ...",
+                index,
+                total,
+                video.video_id,
+                attempt,
+                max_attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+        outcome = await _download_single_once(
+            video,
+            config,
+            index,
+            total,
+            image_semaphore,
+        )
+        if outcome is not _DownloadOutcome.FAILED:
+            return outcome
+
+    logger.error(
+        "[%d/%d] Exhausted retries for %s after %d attempts.",
+        index,
+        total,
+        video.video_id,
+        max_attempts,
+    )
+    return _DownloadOutcome.FAILED
+
+
+async def _download_single_once(
+    video: VideoInfo,
+    config: ScraperConfig,
+    index: int,
+    total: int,
+    image_semaphore: asyncio.Semaphore,
+) -> _DownloadOutcome:
     """Download a single post.
 
     Inspects post metadata first to determine content type, then:
@@ -190,14 +259,14 @@ async def _download_single(
             "metadata extraction",
         )
     except Exception as exc:
-        logger.error(
-            "[%d/%d] Failed to extract info for %s: %s",
+        logger.warning(
+            "[%d/%d] Primary extraction failed for %s: %s",
             index,
             total,
             video.video_id,
             exc,
         )
-        return _DownloadOutcome.FAILED
+        return await _download_embed_fallback(video, config, index, total)
 
     if info is None:
         logger.warning(
@@ -206,9 +275,75 @@ async def _download_single(
             total,
             video.video_id,
         )
+        return await _download_embed_fallback(video, config, index, total)
+
+    outcome = await _download_from_info(
+        video,
+        info,
+        config,
+        index,
+        total,
+        image_semaphore,
+    )
+    if outcome is _DownloadOutcome.FAILED and _has_video_formats(info):
+        return await _download_embed_fallback(video, config, index, total)
+    return outcome
+
+
+async def _download_embed_fallback(
+    video: VideoInfo,
+    config: ScraperConfig,
+    index: int,
+    total: int,
+) -> _DownloadOutcome:
+    """Download a video through TikTok's embed page when post extraction fails."""
+    logger.warning(
+        "[%d/%d] Falling back to TikTok embed for %s.",
+        index,
+        total,
+        video.video_id,
+    )
+    output_path = config.output_dir / f"{video.video_id}.mp4"
+    loop = asyncio.get_running_loop()
+
+    try:
+        await loop.run_in_executor(
+            None,
+            functools.partial(
+                _sync_download_embed,
+                video.video_id,
+                _build_embed_ydl_opts(config, video.video_id),
+            ),
+        )
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise yt_dlp.utils.DownloadError(
+                f"TikTok embed did not create {output_path.name}"
+            )
+    except Exception as exc:
+        logger.error(
+            "[%d/%d] Embed fallback failed for %s: %s",
+            index,
+            total,
+            video.video_id,
+            exc,
+        )
         return _DownloadOutcome.FAILED
 
+    logger.info("[%d/%d] Completed embed fallback for %s.", index, total, video.video_id)
+    return _DownloadOutcome.VIDEO
+
+
+async def _download_from_info(
+    video: VideoInfo,
+    info: dict[str, Any],
+    config: ScraperConfig,
+    index: int,
+    total: int,
+    image_semaphore: asyncio.Semaphore,
+) -> _DownloadOutcome:
+    """Download a post from a resolved yt-dlp metadata payload."""
     has_video = _has_video_formats(info)
+    loop = asyncio.get_running_loop()
 
     if has_video:
         # Standard video post — download via yt-dlp.
@@ -237,8 +372,8 @@ async def _download_single(
             logger.info("[%d/%d] Completed video %s.", index, total, video.video_id)
             return _DownloadOutcome.VIDEO
         except Exception as exc:
-            logger.error(
-                "[%d/%d] Failed video %s: %s",
+            logger.warning(
+                "[%d/%d] Primary video download failed for %s: %s",
                 index,
                 total,
                 video.video_id,
@@ -424,11 +559,19 @@ def _build_extract_opts(config: ScraperConfig) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "logger": _YTDLP_LOGGER,
         "sleep_interval_requests": config.request_delay,
+        "impersonate": _IMPERSONATE_CHROME,
+        "extractor_retries": config.download_retries,
     }
     if config.cookies_file is not None:
         opts["cookiefile"] = str(config.cookies_file)
     return opts
+
+
+def _post_retry_delay_seconds(retry_number: int) -> int:
+    """Return exponential retry delay in seconds for *retry_number* >= 1."""
+    return _POST_RETRY_INITIAL_DELAY_SECONDS * (1 << (retry_number - 1))
 
 
 def _has_video_formats(info: dict[str, Any]) -> bool:
@@ -614,6 +757,7 @@ def _sync_download_file(
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/122.0.0.0 Safari/537.36"
             ),
+            "Referer": "https://www.tiktok.com/",
         },
     )
 
@@ -718,6 +862,15 @@ def _find_completed_artifact(output_dir: Path, video_id: str) -> Path | None:
     return None
 
 
+def _sync_download_embed(video_id: str, opts: dict[str, Any]) -> None:
+    """Download the first direct video exposed by TikTok's embed page."""
+    embed_url = f"https://www.tiktok.com/embed/v2/{video_id}"
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        result = ydl.extract_info(embed_url, download=True)
+        if result is None:
+            raise yt_dlp.utils.DownloadError("TikTok embed returned no metadata")
+
+
 def _build_ydl_opts(
     config: ScraperConfig,
     *,
@@ -735,17 +888,47 @@ def _build_ydl_opts(
         ),
         "quiet": True,
         "no_warnings": True,
+        "logger": _YTDLP_LOGGER,
         "retries": config.download_retries,
+        "extractor_retries": config.download_retries,
         "fragment_retries": config.download_retries,
         "noprogress": True,
         # Conservative spacing complements the bounded wrapper backoff.
         "sleep_interval_requests": config.request_delay,
         "sleep_interval": config.request_delay,
         "max_sleep_interval": 2 * config.request_delay,
+        "impersonate": _IMPERSONATE_CHROME,
     }
 
     if merge:
         opts["merge_output_format"] = "mp4"
+
+    if config.cookies_file is not None:
+        opts["cookiefile"] = str(config.cookies_file)
+
+    return opts
+
+
+def _build_embed_ydl_opts(
+    config: ScraperConfig,
+    video_id: str,
+) -> dict[str, Any]:
+    """Construct yt-dlp options for the TikTok embed fallback."""
+    opts: dict[str, Any] = {
+        "outtmpl": str(config.output_dir / f"{video_id}.mp4"),
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _YTDLP_LOGGER,
+        "retries": config.download_retries,
+        "fragment_retries": config.download_retries,
+        "noprogress": True,
+        # Start fresh instead of resuming a partial primary-download file.
+        "continuedl": False,
+        "overwrites": True,
+        # The embed page exposes the same source twice; only download it once.
+        "playlistend": 1,
+        "impersonate": _IMPERSONATE_CHROME,
+    }
 
     if config.cookies_file is not None:
         opts["cookiefile"] = str(config.cookies_file)

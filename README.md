@@ -12,7 +12,7 @@ CLI tool to scrape all videos from a TikTok creator's profile.
 - Best quality video+audio by default (separate streams are merged via ffmpeg)
 - Two discovery strategies: yt-dlp (primary) with Playwright browser fallback
 - Cookie support for authenticated sessions
-- Bounded exponential backoff with jitter for transient/rate-limit failures
+- Chrome TLS impersonation, bounded retry backoff with jitter, and TikTok embed fallback for unreliable post pages
 - Progress logging and detailed summary
 
 ## Requirements
@@ -20,6 +20,7 @@ CLI tool to scrape all videos from a TikTok creator's profile.
 - Python 3.12+
 - [ffmpeg](https://ffmpeg.org/download.html) (required when a post needs separate video/audio streams merged)
 - [Playwright](https://playwright.dev/python/) Chromium browser (for fallback discovery)
+- [curl-cffi](https://pypi.org/project/curl-cffi/) (used by yt-dlp impersonation for reliable TikTok extraction)
 
 ## Installation
 
@@ -35,6 +36,9 @@ source .venv/bin/activate    # macOS/Linux
 
 # Install with current yt-dlp TikTok support, curl-cffi, and dev tools
 pip install -e ".[dev]"
+
+# If you already installed earlier, upgrade yt-dlp to pick up latest TikTok fixes
+pip install -U "yt-dlp>=2026.8.19"
 
 # Install ffmpeg (required for merging video and audio streams)
 # macOS:
@@ -153,11 +157,15 @@ tiktok-scraper tiktok --limit 50
    - **Audio-only posts** -- no video stream and no images (typically the audio track of a slideshow). Downloaded via yt-dlp by default, or skipped entirely when `--video-only` is active.
 
 3. **Download execution** runs concurrently (default: 3 at a time) with
-   conservative yt-dlp request spacing. Rate limits and transient discovery,
-   metadata, and download failures use bounded exponential backoff with jitter;
-   creator-not-found and permanent failures are not retried. Image downloads
-   retry HTTP 429/5xx and network failures, honor parseable `Retry-After`, and
-   never sleep after the final attempt.
+    conservative yt-dlp request spacing. Rate limits and transient discovery,
+    metadata, and download failures use bounded exponential backoff with jitter;
+    creator-not-found and permanent failures are not retried. Image downloads
+    retry HTTP 429/5xx and network failures, honor parseable `Retry-After`, and
+    never sleep after the final attempt. Video downloads use yt-dlp with
+    Chrome TLS impersonation. If TikTok's normal post page fails its anti-bot
+    challenge, the scraper retries through TikTok's embed endpoint; this
+    fallback prioritises completion and can be lower resolution than the
+    primary download.
 
 4. **Resume detection** scans the output directory for existing completed files
    named `<video_id>.<ext>` and directories named `<video_id>/` (photo
