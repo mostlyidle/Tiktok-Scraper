@@ -6,12 +6,14 @@ build-backend = "setuptools.build_meta"
 name = "tiktok-scraper"
 version = "0.1.0"
 description = "CLI tool to scrape all videos from a TikTok creator's profile."
+readme = "README.md"
 requires-python = ">=3.12"
-license = {text = "MIT"}
+license = {file = "LICENSE"}
+authors = [{name = "LipDevs"}]
 dependencies = [
     "playwright>=1.40.0",
     "yt-dlp>=2026.08.19",
-    "curl-cffi>=0.7.3",
+    "curl-cffi>=0.15.0",
     "click>=8.1.0",
 ]
 
@@ -29,6 +31,8 @@ tiktok-scraper = "tiktok_scraper.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["tiktok_scraper*"]
+namespaces = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

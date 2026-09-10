@@ -111,6 +111,15 @@ Desktop.ini
 # Project-specific (downloaded content)
 downloads/
 
+# Local authentication cookie exports
+cookies/
+cookies.txt
+cookies.json
+cookies*.txt
+cookies*.json
+*.cookie
+*.cookies
+
 # Agent/guide docs (not needed for functionality)
 AGENTS.md
 GUIDE.md

@@ -10,7 +10,7 @@ CLI tool to scrape all videos from a TikTok creator's profile.
 - Automatic resume: skips already-downloaded videos and photo slideshows
 - Concurrent downloads with configurable parallelism
 - Best quality video+audio by default (separate streams are merged via ffmpeg)
-- Two discovery strategies: yt-dlp (primary) with Playwright browser fallback
+- Layered discovery: yt-dlp, embed/channel recovery, and Playwright fallback
 - Cookie support for authenticated sessions
 - Chrome TLS impersonation, bounded retry backoff with jitter, and TikTok embed fallback for unreliable post pages
 - Progress logging and detailed summary
@@ -38,7 +38,7 @@ source .venv/bin/activate    # macOS/Linux
 pip install -e ".[dev]"
 
 # If you already installed earlier, upgrade yt-dlp to pick up latest TikTok fixes
-pip install -U "yt-dlp>=2026.8.19"
+pip install -U "yt-dlp>=2026.08.19"
 
 # Install ffmpeg (required for merging video and audio streams)
 # macOS:
@@ -73,7 +73,9 @@ python -m tiktok_scraper <username>
 The `@` prefix is optional — both `tiktok` and `@tiktok` work.
 
 Usernames may contain letters, numbers, periods, and underscores. `--limit`
-accepts zero or a positive integer; concurrency is always at least one.
+accepts zero or a positive integer; `--limit 0` exits successfully without
+contacting TikTok or creating the output directory. Concurrency is always at
+least one.
 
 ### Options
 
@@ -83,15 +85,18 @@ Usage: tiktok-scraper [OPTIONS] USERNAME
   Scrape all videos from a TikTok creator's profile.
 
 Options:
-  -o, --output-dir PATH       Directory to save videos
-                               (default: ./downloads/<username>/)
-  --cookies PATH              Path to a Netscape-format cookies file
-  -n, --limit INTEGER         Maximum number of videos to download
+  -o, --output-dir DIRECTORY  Directory to save videos (default:
+                              ./downloads/<username>/).
+  --cookies FILE              Path to a Netscape-format cookies file
+  -n, --limit INTEGER RANGE   Maximum number of videos to download.  [x>=0]
   --headless / --no-headless  Run browser in headless mode (default: headless)
-  -c, --concurrency INTEGER   Number of concurrent downloads (default: 3)
+  -c, --concurrency INTEGER RANGE
+                              Number of concurrent downloads.  [default: 3;
+                              x>=1]
   --video-only / --no-video-only
-                              Skip audio-only posts (default: off)
+                               Skip audio-only posts (default: off)
   -v, --verbose               Enable debug logging
+  --version                   Show the version and exit
   -h, --help                  Show this message and exit
 ```
 
@@ -121,6 +126,10 @@ Use cookies for authenticated access:
 tiktok-scraper someuser --cookies cookies.txt
 ```
 
+`--cookies` must point to a readable regular file. `--output-dir` may name an
+existing directory or a new directory path whose parent directories can be
+created.
+
 Skip audio-only posts (download only videos and photo slideshows):
 
 ```bash
@@ -129,7 +138,7 @@ tiktok-scraper someuser --video-only
 
 ### Resume support
 
-Running the same command again automatically skips videos and photo slideshows that have already been downloaded. Videos are detected by filename (e.g. `7123456789012345678.mp4`) and photo slideshows by directory name (e.g. `7123456789012345678/`). This makes it safe to interrupt and restart the scraper.
+Running the same command again automatically skips videos and photo slideshows that have already been downloaded. Videos are detected by validated media files named `<id>.<ext>` and photo slideshows by validated directories named `<id>/`. New slideshows also contain a completion manifest recording the expected image set. This makes it safe to interrupt and restart the scraper.
 
 Existing numeric-ID files and directories are never relocated. Video downloads
 are written as `<id>.<ext>` and slideshow images are staged in
@@ -149,28 +158,28 @@ tiktok-scraper tiktok --limit 50
 
 ## How it works
 
-1. **Video discovery** uses yt-dlp's TikTok extractor as the primary method. It handles TikTok's anti-bot protections natively and is fast and reliable. If TikTok blocks profile hydration, the scraper fetches profile/video embed data to recover the account's secondary user ID, then retries discovery through yt-dlp's `tiktokuser:<channel_id>` route. If that also fails, a Playwright-based browser fallback scrolls the profile page and collects video and photo URLs via DOM parsing and API response interception.
+1. **Video discovery** uses yt-dlp's TikTok extractor as the primary method. It handles TikTok's anti-bot protections natively and is fast and reliable. If TikTok blocks profile hydration, the scraper fetches profile/video embed data to recover the account's secondary user ID, verifies the post author, then retries discovery through yt-dlp's `tiktokuser:<channel_id>` route. If that also fails, a Playwright-based browser fallback scrolls the profile page and collects validated video and photo URLs via DOM parsing, hydration data, and API response interception.
 
 2. **Content classification** inspects each post's metadata (via yt-dlp's `extract_info`) before downloading. Posts are classified as one of three types:
    - **Video posts** -- have at least one video stream. Separate video and audio streams are merged into a single `.mp4` file via ffmpeg when available; a progressive video+audio format is selected when merging is unnecessary or ffmpeg is unavailable. This avoids incomplete output while retaining the best quality when possible.
-   - **Photo slideshows** -- no video stream, but contain image URLs. The individual images are downloaded directly into a `<video_id>/` subdirectory.
+   - **Photo slideshows** -- identified by a photo URL or semantic image-post data. The individual images are downloaded directly into a `<video_id>/` subdirectory and committed with a manifest only after every expected image validates.
    - **Audio-only posts** -- no video stream and no images (typically the audio track of a slideshow). Downloaded via yt-dlp by default, or skipped entirely when `--video-only` is active.
 
-3. **Download execution** runs concurrently (default: 3 at a time) with
-    conservative yt-dlp request spacing. Rate limits and transient discovery,
-    metadata, and download failures use bounded exponential backoff with jitter;
-    creator-not-found and permanent failures are not retried. Image downloads
-    retry HTTP 429/5xx and network failures, honor parseable `Retry-After`, and
-    never sleep after the final attempt. Video downloads use yt-dlp with
-    Chrome TLS impersonation. If TikTok's normal post page fails its anti-bot
-    challenge, the scraper retries through TikTok's embed endpoint; this
-    fallback prioritises completion and can be lower resolution than the
-    primary download.
+3. **Download execution** runs concurrently (default: 3 at a time) while a
+     shared session limiter spaces request starts. The configured retry budget
+     belongs to the complete post workflow, with bounded exponential backoff,
+     jitter, and `Retry-After` support; permanent and local failures are not
+     retried. Each post is claimed with a per-ID lock so concurrent processes do
+     not publish the same artifact. Video downloads use yt-dlp with Chrome TLS
+     impersonation. If TikTok's normal post page fails its anti-bot challenge,
+     the scraper retries through TikTok's embed endpoint; this fallback
+     prioritises completion and can be lower resolution than the primary
+     download.
 
-4. **Resume detection** scans the output directory for existing completed files
-   named `<video_id>.<ext>` and directories named `<video_id>/` (photo
-   slideshows), skipping any content that is already present. Temporary video
-   artifacts are never treated as completed.
+4. **Resume detection** scans the output directory for existing validated files
+    named `<video_id>.<ext>` and directories named `<video_id>/` (photo
+    slideshows), skipping any content that is already present. Temporary,
+    corrupt, symlinked, and unrelated artifacts are never treated as completed.
 
 ### Rate limits and cookies
 
@@ -180,12 +189,20 @@ are spaced, but TikTok can still rate-limit or challenge automated traffic.
 Cookies are optional and should only be exported from an account you control.
 Use a Netscape-format file, keep it private, never commit it, and do not share
 it: cookies can grant access to the account until they expire or are revoked.
+Cookie export files such as `cookies.txt` and `cookies.json` are ignored by
+this repository's Git configuration.
+
+The CLI summary reports video, audio, and photo-post downloads separately. A
+non-zero failed count produces exit status 1, and inconclusive blocked
+discovery also exits non-zero rather than being reported as an empty account.
+Failure IDs and sanitized terminal reasons are included in the summary.
 
 If a post requires separate video and audio streams with no progressive
 fallback, ffmpeg is checked immediately before that post is downloaded. The
 post is reported as failed rather than silently producing incomplete output
-when ffmpeg is unavailable. A successful download also requires a final
-non-temporary artifact.
+when ffmpeg is unavailable. Successful downloads require validated final
+media artifacts; image transfers are bounded by the configured timeout and
+size limit.
 
 ## Development
 
@@ -229,6 +246,7 @@ mypy tiktok_scraper/
 ## Project structure
 
 ```
+LICENSE                 MIT license text
 tiktok_scraper/
     __init__.py        Package init
     __main__.py        python -m support
@@ -242,6 +260,11 @@ tiktok_scraper/
 tests/
     conftest.py        Shared fixtures
     test_cli.py        CLI tests
+    test_entrypoint.py Module entry point test
     test_scraper.py    Scraper tests (yt-dlp + browser)
     test_downloader.py Downloader tests
 ```
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

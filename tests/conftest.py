@@ -1,5 +1,6 @@
 """Shared test fixtures."""
 
+import socket
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -7,6 +8,18 @@ import pytest
 
 from tiktok_scraper.config import ScraperConfig
 from tiktok_scraper.models import VideoInfo
+
+
+@pytest.fixture(autouse=True)
+def deny_external_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unit tests hermetic; live checks must opt into integration."""
+    if request.node.get_closest_marker("integration") is not None:
+        return
+
+    def _blocked_connect(_sock: socket.socket, address: object) -> None:
+        raise AssertionError(f"unexpected network connection in unit test: {address}")
+
+    monkeypatch.setattr(socket.socket, "connect", _blocked_connect)
 
 
 @pytest.fixture()
