@@ -1464,14 +1464,6 @@ def _channel_ids_from_author(value: Any) -> tuple[set[str], bool]:
     return set(), False
 
 
-def _channel_id_from_author(value: Any) -> str | None:
-    """Read a secondary user ID without searching unrelated post fields."""
-    channel_ids, invalid = _channel_ids_from_author(value)
-    if invalid or len(channel_ids) != 1:
-        return None
-    return next(iter(channel_ids))
-
-
 async def _retry_ytdlp_operation(
     operation: Any,
     config: ScraperConfig,

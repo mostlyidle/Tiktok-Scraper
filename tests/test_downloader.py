@@ -21,10 +21,11 @@ from tiktok_scraper.downloader import (
     MetadataMismatchError,
     _build_embed_ydl_opts,
     _build_ydl_opts,
+    _classify_download_error,
     _extract_image_urls,
+    _FailureKind,
     _find_completed_artifact,
     _has_video_formats,
-    _is_retryable_download_error,
     _photo_variant_url,
     _requires_ffmpeg,
     _SafeImageRedirectHandler,
@@ -363,6 +364,27 @@ class TestDownloadVideos:
         assert result.skipped == len(sample_videos)
         assert result.downloaded == 0
         assert mock_dl.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_leaves_unclaimed_staging_untouched(
+        self,
+        scraper_config: ScraperConfig,
+        sample_videos: list[VideoInfo],
+    ) -> None:
+        """A startup scan must not delete staging without claiming its post."""
+        output = scraper_config.output_dir
+        output.mkdir(parents=True, exist_ok=True)
+        video = sample_videos[0]
+        (output / f"{video.video_id}.mp4").write_bytes(_VALID_MP4)
+        staging = output / ".7123456789012345699.download"
+        staging.mkdir()
+        partial = staging / "7123456789012345699.mp4.part"
+        partial.write_bytes(b"in progress")
+
+        result = await download_videos([video], scraper_config)
+
+        assert result.skipped == 1
+        assert partial.read_bytes() == b"in progress"
 
     @pytest.mark.asyncio
     async def test_deduplicates_input_ids_before_download(
@@ -1397,8 +1419,14 @@ class TestSyncDownloadFileRetry:
 
     def test_local_filesystem_errors_are_not_retried(self, tmp_path: Path) -> None:
         dest = tmp_path / "image.jpg"
-        assert not _is_retryable_download_error(PermissionError("permission denied"))
-        assert _is_retryable_download_error(urllib.error.URLError("network"))
+        assert (
+            _classify_download_error(PermissionError("permission denied"))
+            is _FailureKind.LOCAL
+        )
+        assert (
+            _classify_download_error(urllib.error.URLError("network"))
+            is _FailureKind.TRANSIENT
+        )
         with (
             patch(
                 "tiktok_scraper.downloader._open_image_url",

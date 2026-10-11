@@ -143,8 +143,9 @@ Running the same command again automatically skips videos and photo slideshows t
 Existing numeric-ID files and directories are never relocated. Video downloads
 are written as `<id>.<ext>` and slideshow images are staged in
 `.<id>.partial/` before being atomically renamed to `<id>/`. Partial staging
-directories are not considered complete. Stale `.part`, `.ytdl`, and `.tmp`
-files inside slideshow staging directories are removed safely on the next run.
+directories are not considered complete. When a post is retried, its stale
+staging directory is removed while holding that post's lock. Staging directories
+for other posts are left untouched.
 yt-dlp resume files in the output root are retained and ignored for completion
 detection, while completed files are preserved.
 

@@ -47,7 +47,6 @@ _TIKTOK_HOSTS = frozenset(
 )
 _TEMPORARY_SUFFIXES = (".part", ".ytdl", ".tmp")
 _VALID_VIDEO_ID_PATTERN = re.compile(r"\d{15,25}\Z")
-_DOWNLOAD_STAGING_PATTERN = re.compile(r"\.\d{15,25}\.(?:partial|download)\Z")
 _STALE_LOCK_GRACE_SECONDS = 30.0
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _IMAGE_SUFFIXES = (".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp")
@@ -770,32 +769,6 @@ def _has_media_signature(suffix: str, header: bytes, media_type: str | None) -> 
     if suffix == ".flac":
         return header.startswith(b"fLaC")
     return False
-
-
-def cleanup_temporary_artifacts(output_dir: Path) -> None:
-    """Remove stale download staging trees without touching resumable files."""
-    root = validate_output_dir(output_dir)
-    if not root.exists():
-        return
-    for staging_dir in root.iterdir():
-        if not _DOWNLOAD_STAGING_PATTERN.fullmatch(staging_dir.name):
-            continue
-        if staging_dir.is_symlink():
-            logger.warning("Leaving symlinked staging path untouched: %s", staging_dir)
-            continue
-        suffix = ".partial" if staging_dir.name.endswith(".partial") else ".download"
-        post_id = staging_dir.name[1 : -len(suffix)]
-        lock_path = root / f".{post_id}.lock"
-        if _lock_is_active(lock_path):
-            logger.debug("Leaving active staging path untouched: %s", staging_dir)
-            continue
-        try:
-            if staging_dir.is_dir():
-                shutil.rmtree(staging_dir)
-            elif staging_dir.exists():
-                staging_dir.unlink()
-        except OSError:
-            logger.debug("Could not remove stale staging path %s", staging_dir)
 
 
 def parse_retry_after(

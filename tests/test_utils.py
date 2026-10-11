@@ -14,7 +14,6 @@ from tiktok_scraper.models import VideoInfo
 from tiktok_scraper.utils import (
     RequestLimiter,
     bounded_backoff,
-    cleanup_temporary_artifacts,
     extract_post_id,
     extract_video_id,
     get_downloaded_ids,
@@ -106,31 +105,6 @@ def test_resume_requires_nonempty_completed_artifacts(tmp_path: Path) -> None:
     assert not is_completed_artifact(output / "7123456789012345678.mp4")
     assert is_completed_artifact(complete_dir)
     assert is_completed_slideshow_artifact(complete_dir)
-
-
-def test_cleanup_only_removes_slideshow_temporary_files(tmp_path: Path) -> None:
-    output = tmp_path / "downloads"
-    output.mkdir()
-    root_part = output / "7123456789012345678.mp4.part"
-    root_ytdl = output / "7123456789012345678.mp4.ytdl"
-    root_part.write_bytes(b"resume")
-    root_ytdl.write_bytes(b"resume")
-    staging = output / ".7123456789012345678.partial"
-    staging.mkdir()
-    stale = staging / "image_1.jpg.part"
-    stale.write_bytes(b"stale")
-    complete = staging / "image_2.jpg"
-    complete.write_bytes(b"keep")
-    download_staging = output / ".7123456789012345679.download"
-    download_staging.mkdir()
-    (download_staging / "7123456789012345679.mp4.part").write_bytes(b"stale")
-
-    cleanup_temporary_artifacts(output)
-
-    assert root_part.exists()
-    assert root_ytdl.exists()
-    assert not staging.exists()
-    assert not download_staging.exists()
 
 
 def test_video_info_rejects_invalid_ids_and_mismatched_urls() -> None:

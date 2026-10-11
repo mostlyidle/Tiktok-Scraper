@@ -33,7 +33,6 @@ from tiktok_scraper.utils import (
     RequestLimiter,
     bounded_backoff,
     check_ffmpeg,
-    cleanup_temporary_artifacts,
     is_completed_artifact,
     is_completed_slideshow_artifact,
     is_valid_video_id,
@@ -146,7 +145,6 @@ async def download_videos(
         A :class:`ScrapeResult` summarising the session.
     """
     validate_output_dir(config.output_dir, create=True)
-    cleanup_temporary_artifacts(config.output_dir)
 
     unique_videos = _deduplicate_videos(videos, config.username)
     result = ScrapeResult(
@@ -574,13 +572,11 @@ async def _download_single_once(
     extract_opts = _build_extract_opts(config)
 
     try:
-        info = await _retry_operation(
+        info = await _run_operation(
             lambda: loop.run_in_executor(
                 None,
                 functools.partial(_sync_extract_info, video.url, extract_opts),
             ),
-            config,
-            "metadata extraction",
             request_limiter=request_limiter,
         )
     except Exception as exc:
@@ -668,7 +664,7 @@ async def _download_embed_fallback(
     embed_opts["_expected_author"] = video.username
 
     try:
-        metadata = await _retry_operation(
+        metadata = await _run_operation(
             lambda: loop.run_in_executor(
                 None,
                 functools.partial(
@@ -677,8 +673,6 @@ async def _download_embed_fallback(
                     embed_opts,
                 ),
             ),
-            config,
-            f"embed {video.video_id}",
             request_limiter=request_limiter,
         )
         if isinstance(metadata, dict):
@@ -760,7 +754,7 @@ async def _download_from_info(
             video_id=video.video_id,
         )
         try:
-            artifact_valid = await _retry_operation(
+            artifact_valid = await _run_operation(
                 lambda: loop.run_in_executor(
                     None,
                     functools.partial(
@@ -771,8 +765,6 @@ async def _download_from_info(
                         "video",
                     ),
                 ),
-                config,
-                f"video {video.video_id}",
                 request_limiter=request_limiter,
             )
             if artifact_valid is not True:
@@ -849,7 +841,7 @@ async def _download_from_info(
     )
     ydl_opts = _build_ydl_opts(config, merge=False, video_id=video.video_id)
     try:
-        artifact_valid = await _retry_operation(
+        artifact_valid = await _run_operation(
             lambda: loop.run_in_executor(
                 None,
                 functools.partial(
@@ -860,8 +852,6 @@ async def _download_from_info(
                     "audio",
                 ),
             ),
-            config,
-            f"audio {video.video_id}",
             request_limiter=request_limiter,
         )
         if artifact_valid is not True:
@@ -1143,15 +1133,12 @@ def _commit_staged_artifact(
     return final
 
 
-async def _retry_operation(
+async def _run_operation(
     operation: Any,
-    config: ScraperConfig,
-    label: str,
     *,
     request_limiter: RequestLimiter | None = None,
 ) -> Any:
     """Run one transport operation; retries belong to the post workflow."""
-    del config, label
     if request_limiter is not None:
         await request_limiter.acquire()
     operation_task = asyncio.ensure_future(operation())
@@ -1164,11 +1151,6 @@ async def _retry_operation(
         with contextlib.suppress(BaseException):
             await asyncio.shield(operation_task)
         raise
-
-
-def _is_retryable_download_error(exc: Exception) -> bool:
-    """Return whether a download error belongs to the transient class."""
-    return _classify_download_error(exc) is _FailureKind.TRANSIENT
 
 
 def _classify_download_error(exc: Exception) -> _FailureKind:
@@ -2077,11 +2059,13 @@ def _find_completed_artifact(
     if not root.exists():
         return None
     prefix = f"{video_id}."
-    for path in root.iterdir():
-        if not path.name.startswith(prefix):
-            continue
-        if is_completed_artifact(path, media_type=media_type):
-            return path
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if not entry.name.startswith(prefix):
+                continue
+            path = Path(entry.path)
+            if is_completed_artifact(path, media_type=media_type):
+                return path
     return None
 
 
