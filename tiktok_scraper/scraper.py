@@ -1433,11 +1433,6 @@ def _extract_embed_author(html: str, video_id: str) -> str | None:
     return next(iter(href_authors)) if len(href_authors) == 1 else None
 
 
-def _find_nested_channel_id(value: Any) -> str | None:
-    """Find a valid secondary user ID in an author-shaped value."""
-    return _channel_id_from_author(value)
-
-
 def _channel_ids_from_author(value: Any) -> tuple[set[str], bool]:
     """Collect every secondary ID from an author-shaped value."""
     if isinstance(value, dict):

@@ -33,6 +33,7 @@ from tiktok_scraper.utils import (
     RequestLimiter,
     bounded_backoff,
     check_ffmpeg,
+    cleanup_temporary_artifacts,
     is_completed_artifact,
     is_completed_slideshow_artifact,
     is_valid_video_id,
@@ -145,6 +146,7 @@ async def download_videos(
         A :class:`ScrapeResult` summarising the session.
     """
     validate_output_dir(config.output_dir, create=True)
+    cleanup_temporary_artifacts(config.output_dir)
 
     unique_videos = _deduplicate_videos(videos, config.username)
     result = ScrapeResult(
